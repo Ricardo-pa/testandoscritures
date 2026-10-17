@@ -1,5 +1,5 @@
 --[[
-    BSU v1.2.5 — Bee Swarm Unleashed
+    BSU v1.3.0 — Bee Swarm Unleashed
     Reescrito do zero:
       * fila de tarefas por prioridade (cada tarefa diz SE quer rodar e POR QUÊ)
       * interrupção padronizada (token raro, colmeia, etc. param o que estiver rodando)
@@ -16,7 +16,7 @@ if _G.BSU2 and _G.BSU2.Destroy then pcall(_G.BSU2.Destroy) end
 if _G.BSU and _G.BSU.Destroy then pcall(_G.BSU.Destroy) end
 task.wait(0.15)
 
-local VERSION = "1.2.5"
+local VERSION = "1.3.0"
 local Env = { Running = true, Conns = {} }
 _G.BSU2 = Env
 
@@ -2238,22 +2238,54 @@ end
 
 -- { [nome] = { objs = {...}, complete = 
 bool } }
+-- Junta o painel (PlayerGui) com o UpdateQuests (vem do servidor, não depende do menu aberto).
+-- Por objetivo fica o maior progresso das duas fontes (progresso só sobe).
+-- Menu fechado e painel vazio sem UpdateQuests: usa a última foto conhecida.
+Quest.seen, Quest.updT, Quest.lastKnown = {}, 0, {}
+Quest.gotT, Quest.doneT, Quest.readyAt, Quest.pending = {}, {}, {}, nil
+Quest.claimCD = {}
+local function isTemplate(n) n = n:lower() return n:find("template", 1, true) or n:find("example", 1, true) end
 function Quest.read()
     if Quest.cache and tick() - Quest.cacheT < 0.5 then return Quest.cache end
     local out = {}
+    local function put(name, objs)
+        local cur = out[name]
+        if not cur then
+            cur = { objs = {} }
+            out[name] = cur
+        end
+        for i, o in ipairs(objs) do
+            local e = cur.objs[i]
+            if not e or (o.p or 0) > (e.p or 0) or (o.done and not e.done) then cur.objs[i] = o end
+        end
+    end
+    local panelN = 0
     local c = Quest.container()
     if c then
         for _, f in ipairs(c:GetChildren()) do
-            if f:IsA("GuiObject") and f.Visible then
+            if f:IsA("GuiObject") and not isTemplate(f.Name) then
                 local objs = frameObjs(f)
-                local complete = #objs > 0
-                for _, o in ipairs(objs) do if not o.done then complete = false break end end
-                out[f.Name] = { objs = objs, complete = complete }
+                if #objs > 0 then put(f.Name, objs) panelN += 1 end
             end
         end
-    else
-        for n, q in pairs(Quest.upd) do out[n] = q end
     end
+    if Quest.updT > 0 then
+        -- o servidor já mandou a lista: ela manda (o painel atrasa e às vezes mostra quest já entregue)
+        out = {}
+        for n, q in pairs(Quest.upd) do put(n, q.objs) end
+    end
+    local talked = Quest.lastTalk and 
+tick() - Quest.lastTalk.t < 10
+    if not next(out) and next(Quest.lastKnown) and not talked and Quest.updT == 0 then
+        out = Quest.lastKnown   -- painel sumiu (menu fechado?) e não tem outra fonte: mantém o que sabia
+    end
+    for _, q in pairs(out) do
+        local complete = #q.objs > 0
+        for _, o in ipairs(q.objs) do if not o.done then complete = false break end end
+        q.complete = complete
+    end
+    Quest.lastKnown = out
+    Quest.panelN = panelN
     Quest.cache, Quest.cacheT = out, tick()
     return out
 end
@@ -2288,11 +2320,25 @@ function Quest.onAdded(name)
     Quest.cacheT = 0
     task.wait(0.15)
     local q = Quest.read()[name]
+    if not Quest.owner[name] then
+        local pre = name:match("^(.-)%s*|")
+        if pre and pre ~= "" and NPCF and NPCF:FindFirstChild(pre) then
+            Quest.setOwner(name, pre, "nome da quest")
+            return
+        end
+        local pd = Quest.pending
+        if pd and tick() - pd.t < 90 and not (pd.npc ~= MOTHER and q and #q.objs > 0 and Quest.isMother(q)) then
+            Quest.pending = nil
+            Quest.setOwner(name, pd.npc, "aceitou no diálogo")
+            return
+        end
+    end
     local lt = Quest.lastTalk
     if lt and tick() - lt.t < 8 then
         local npc = lt.npc
         if q and #q.objs > 0 and Quest.isMother(q) then npc = MOTHER end
-        if npc == MOTHER and q and #q.objs > 0 and not Quest.isMother(q) then
+        if npc == MOTHER and q and #q.objs > 0 and not 
+Quest.isMother(q) then
             Quest.infer(name, q)   -- Mother sempre tem raise/feed: não é dela
         else
             Quest.setOwner(name, npc, "conversa")
@@ -2303,43 +2349,98 @@ function Quest.onAdded(name)
 end
 function Quest.onRemoved(name)
     Quest.cacheT = 0
+    Quest.seen[name] = nil
+    Quest.upd[name] = nil
     local owner = Quest.owner[name]
     St.quests += 1
-    if owner then Quest.cooldown[owner] = nil end
+    if owner then 
+Quest.cooldown[owner] = nil end
     if Hook.questDone then Hook.questDone(name, owner) end
 end
 
--- liga no painel (e religa se o jogo recriar)
-task.spawn(function()
-    local bound
-    while running() do
+-- O servidor só manda o UpdateQuests enquanto o menu de quests está "aberto":
+-- o jogo avisa com Events.StateSet("Quests") ao abrir e StateSet("") ao fechar.
+-- Com o menu fechado, o BSU manda StateSet("Quests") a cada 3s pra continuar recebendo o progresso.
+do
+    local stateR = remote("StateSet")
+    local function menuOpen()
         local c = Quest.container()
-        if c and c ~= bound then
-            bound = c
-            conn(c.ChildAdded:Connect(function(f)
-                if f:IsA("GuiObject") then task.spawn(Quest.onAdded, f.Name) end
-            end))
-            conn(c.ChildRemoved:Connect(function(f)
-                if f:IsA("GuiObject") then Quest.onRemoved(f.Name) end
-            end))
-            task.wait(1)
-            for n, q in pairs(Quest.read()) do Quest.infer(n, q) end
+        local q = c and c.Parent
+        return q and q:IsA("GuiObject") and q.Visible and q.Position.X.Scale > -0.05
+    end
+    if stateR then
+        task.spawn(function()
+            while running() do
+                if (Cfg.AutoQuest or next(Cfg.QuestClaim)) and not menuOpen() then
+                    pcall(function() stateR:FireServer("Quests") end)
+                end
+                task.wait(3)
+            end
+        end)
+    end
+end
+
+-- acompanha as quests (painel 
++ UpdateQuests) a cada 1s: quest nova -> dono; sumiu de verdade -> entregue
+Quest.goneT = {}
+task.spawn(function()
+    task.wait(1)
+    for n in pairs(Quest.read()) do Quest.seen[n] = true end
+    for n, q in pairs(Quest.read()) do Quest.infer(n, q) end
+    while running() do
+        Quest.cacheT = 0
+        local qs = Quest.read()
+        for n in pairs(qs) do
+            Quest.goneT[n] = nil
+            if not Quest.seen[n] then
+                Quest.seen[n] = true
+                task.spawn(Quest.onAdded, n)
+            end
         end
-        task.wait(2)
+        for n in pairs(Quest.seen) do
+            if not qs[n] then
+                Quest.goneT[n] = Quest.goneT[n] or tick()
+                -- sumiu por 2s seguidos e dá pra confiar: o servidor confirmou, ou o painel ainda mostra outras,
+                -- ou acabou de falar com um urso
+                local talked = Quest.lastTalk and tick() - Quest.lastTalk.t < 15
+                local sure = (Quest.updT > Quest.goneT[n]) or (Quest.panelN or 0) > 0 or talked
+                if tick() - Quest.goneT[n] > 2 and sure then
+                    Quest.goneT[n] = nil
+                    Quest.onRemoved(n)
+                end
+            end
+        end
+        task.wait(1)
     end
 end)
 
 -- remotes
 if QRemote then
-    conn(QRemote.OnClientEve
-nt:Connect(function(npc, text, more)
+    conn(QRemote.OnClientEvent:Connect(function(npc, text, more)
         if type(npc) == "string" then
             Quest.dialog = { npc = npc, text = tostring(text or ""), t = tick(), more = more }
             local low = Quest.dialog.text:lower()
-            -- "I haven't quite finished preparing the next quest for you." = ainda sem quest nova
+            -- "I haven't quite finished 
+preparing the next quest for you." = ainda sem quest nova
             if low:find("preparing", 1, true) or low:find("haven't quite", 1, true) or low:find("havent quite", 1, true) then
                 Quest.notReady = Quest.notReady or {}
                 Quest.notReady[npc] = tick()
+            end
+            -- "Come back to me in 03:44" = tempo exato até a próxima quest
+            local mm, ss = low:match("come back[^%d]*(%d+):(%d+)")
+            if mm then
+                Quest.readyAt[npc] = tick() + tonumber(mm) * 60 + tonumber(ss) + 3
+                Quest.notReady[npc] = tick()
+            end
+            -- aceitou quest nova: a quest só chega no painel/UpdateQuests no próximo progresso (pode levar ~20s)
+            if low:find("check your quest menu", 1, true) or low:find("complete it and", 1, true) then
+                Quest.gotT[npc] = tick()
+                Quest.pending = { npc = npc, t = tick() }
+            end
+            -- entregou
+            if low:find("great job", 1, true) or low:find("here's some", 1, true) or low:find("heres some", 1, true)
+                or low:find("well done", 1, true) then
+                Quest.doneT[npc] = tick()
             end
             Quest.lastTalk = { npc = npc, t = tick() }
         end
@@ -2350,19 +2451,22 @@ do
     if r then
         conn(r.OnClientEvent:Connect(function(list)
             if type(list) ~= "table" then return end
+            Quest.upd = {}
+            Quest.updT = tick()
             for _, q in pairs(list) do
-                if type(q) == "table" and type(q[1]) == "string" then
+                if type(q) == "table" and 
+type(q[1]) == "string" then
                     local objs = {}
                     for _, o in pairs(type(q[2]) == "table" and q[2] or {}) do
-                        if type(o) == "table" 
-then
+                        if type(o) == "table" then
                             local p = tonumber(o[2]) or 0
                             local txt = tostring(o[1] or "")
                             table.insert(objs, { text = txt, p = p, done = p >= 0.999 or txt:find("Complete!", 1, true) ~= nil })
                         end
                     end
                     local complete = #objs > 0
-                    for _, o in ipairs(objs) do if not o.done then complete = false end end
+                    for _, o in ipairs(objs) do 
+if not o.done then complete = false end end
                     Quest.upd[q[1]] = { objs = objs, complete = complete }
                 end
             end
@@ -2395,18 +2499,17 @@ function Quest.npcState(npc, qs)
 end
 function Quest.unknown(qs)
     local t = {}
-    for n, q in pairs(qs or Quest.read()) do if not Quest.owner[n] then t[n] = q end 
-end
+    for n, q in pairs(qs or Quest.read()) do if not Quest.owner[n] then t[n] = q end end
     return t
 end
 
 -- ursos com tempo entre quests (Gray Bear: 5 min): só pega quando o aviso do jogo (WarnEvent) diz que tem quest
 Quest.WARN_ONLY = { ["Gray Bear"] = true }
 Quest.REPEAT_CD = { ["Gray Bear"] = 5 * 60 + 5 }   -- tempo entre quests (contado de quando pegou)
-Quest.notReady, Quest.blockUntil, Quest.pickT = Quest.notReady or {}, {}, {}
+Quest.notReady, Quest.blockUntil, 
+Quest.pickT = Quest.notReady or {}, {}, {}
 -- urso que o script FAZ as quests (Auto Complete + toggle do urso)
-function Quest.doing(npc) return Cfg.AutoQuest and 
-Cfg.QuestNPCs[npc] == true end
+function Quest.doing(npc) return Cfg.AutoQuest and Cfg.QuestNPCs[npc] == true end
 -- urso que o script só ENTREGA quando fica pronta (Auto Claim)
 function Quest.claims(npc) return Cfg.QuestClaim[npc] == true end
 function Quest.active(npc) return Quest.doing(npc) or Quest.claims(npc) end
@@ -2426,7 +2529,8 @@ Quest.REPEATABLE = { "Polar Bear", "Gray Bear" }
 function Quest.npcGroup(repeatable)
     local t = {}
     for _, n in ipairs(Quest.npcNames()) do
-        if (table.find(Quest.REPEATABLE, n) ~= nil) == repeatable then table.insert(t, n) end
+        if 
+(table.find(Quest.REPEATABLE, n) ~= nil) == repeatable then table.insert(t, n) end
     end
     return t
 end
@@ -2437,9 +2541,10 @@ function Quest.needs(npc, qs)
     local doing = Quest.doing(npc)
     if not (doing or Quest.claims(npc)) then return nil end
     if Quest.forced[npc] and doing then return "visita manual", true end
-    if tick() < (Quest.cooldown[npc] or 0) then return nil end
+    -- quest pronta passa por cima do intervalo normal (só espera 45s se a última entrega falhou)
     local active, complete = Quest.npcState(npc, qs)
-    if complete then return "entregar quest de " .. npc, true end
+    if complete and tick() >= (Quest.claimCD[npc] or 0) then return "entregar quest de " .. npc, true end
+    if tick() < (Quest.cooldown[npc] or 0) then return nil end
     if not doing then return nil end   -- só Auto Claim: não pega nem faz quest
     -- urso disse que ainda não tem quest nova: não volta antes do tempo (mesmo com o aviso do jogo)
     if not active and tick() < (Quest.blockUntil[npc] or 0) then return nil end
@@ -2447,12 +2552,12 @@ function Quest.needs(npc, qs)
     if Quest.retry and (Quest.retry[npc] or 0) > 0 and not active then return "pegar quest nova de " .. npc, true end
     if active then return nil end
     -- quest pronta sem dono: tenta nos ursos sem quest conhecida
-    for n, q in 
-pairs(Quest.unknown(qs)) do
+    for n, q in pairs(Quest.unknown(qs)) do
         if q.complete and (npc ~= MOTHER or Quest.isMother(q)) then return "tentar entregar \"" .. n .. "\" em " .. npc, true end
     end
     if Quest.avail[npc] == false then return nil end
-    return "ver se " .. npc .. " tem quest", false
+    return "ver se " .. npc .. " tem 
+quest", false
 end
 function Quest.next()
     local qs = Quest.read()
@@ -2465,13 +2570,22 @@ function Quest.next()
 end
 function Quest.want()
     if not ((Cfg.AutoQuest or next(Cfg.QuestClaim)) and QRemote and NPCF) or Sprout.looting() then return nil end
+    if Quest.bgBusy then return nil 
+end
     if tick() - Quest.wantT < 0.5 then return Quest.wantCache end
     Quest.wantT = tick()
     local npc, why, urg = Quest.next()
     local r = nil
+    if npc and Quest.remoteOk[npc] and tick() - (Quest.remoteFail[npc] or 0) > 600 then
+        -- de longe: não precisa esvaziar a bolsa nem sair do field, já dispara
+        Quest.wantCache = nil
+        Quest.run()
+        return nil
+    end
     if npc then
         if urg and not Cfg.QuestAfterConvert then r = why
-        elseif U.bagEmpty() then r = why end
+        elseif U.bagEmpty() then r = 
+why end
     end
     Quest.wantCache = r
     return r
@@ -2496,7 +2610,8 @@ function Quest.talk(npc)
         pcall(function() QRemote:FireServer(npc, "Continue") end)
         local t1 = tick()
         while tick() - t1 < 1 and Quest.dialog.t == before do task.wait(0.03) end
-        if Quest.dialog.t == before then return false end
+        if Quest.dialog.t == before then 
+return false end
     end
     local noReply = 0
     for _ = 1, 40 do
@@ -2519,28 +2634,32 @@ end
 
 local function nameSet(qs) local s = {} for n in pairs(qs) do s[n] = true end return s end
 
-function Quest.visit(npc)
+Quest.remoteFail = {}   -- npc -> hora em que falar de longe falhou (aí vai andando por 10 min)
+Quest.remoteOk = {}     -- npc -> já respondeu de longe (aí a conversa roda em segundo plano, sem parar o farm)
+Quest.bgBusy = false    -- conversa em segundo plano rolando (uma por vez: o diálogo é um só)
+-- bg = true: só de longe, em segundo plano (não para o farm nem a ferramenta)
+function Quest.visit(npc, bg)
     local model = NPCF and NPCF:FindFirstChild(npc)
     if not model then return end
-    St.useTool = false
-    act("Indo até " .. npc)
-    Move.tween(Quest.standPos(model))
-    local hrp = U.hrp()
-    if hrp then 
-hrp.AssemblyLinearVelocity = Vector3.zero hrp.Anchored = true end
+    if not bg then St.useTool = false end
     local tryingUnknown = {}
     for n, q in pairs(Quest.unknown()) do if q.complete then tryingUnknown[n] = true end end
     local turnedIn = false
     local visitT = tick()
-    local ok, err = pcall(function()
-        for _ = 1, 5 do
+    -- conversa inteira (pega/entrega 
+até 5 vezes); devolve false se o urso não respondeu na 1ª
+    local function session(remote)
+        for i = 1, 5 do
             if not (running() and Quest.active(npc)) then break end
             Quest.cacheT = 0
             local before = nameSet(Quest.read())
+            local tTalk = tick()
             if not Quest.talk(npc) then
-                -- logo depois de entregar o urso às vezes demora pra 
-responder: tenta mais uma vez
-                if not turnedIn then act(npc .. ": não respondeu") break end
+                if i == 1 and not turnedIn then
+                    if not remote then act(npc .. ": não respondeu") end
+                    return false
+                end
+                -- logo depois de entregar o urso às vezes demora pra responder: tenta mais uma vez
                 task.wait(1)
                 if not Quest.talk(npc) then act(npc .. ": não respondeu") break end
             end
@@ -2548,29 +2667,66 @@ responder: tenta mais uma vez
             Quest.cacheT = 0
             local now = Quest.read()
             local changed = false
+            if (Quest.gotT[npc] or 0) >= tTalk then changed = true Quest.pickT[npc] = Quest.gotT[npc] end
+            if (Quest.doneT[npc] or 0) >= tTalk then changed = true turnedIn = true end
             for n in pairs(now) do
                 if not before[n] then
                     changed = true
                     Quest.pickT[npc] = tick()
                     -- sem painel (só UpdateQuests): o diff aqui decide o dono
-                    if not Quest.owner[n] then Quest.setOwner(n, npc, "conversa") end
+                    -- quest atrasada de outro urso (aceita antes) não é desse
+                    local pd = Quest.pending
+                    if not Quest.owner[n] and not (pd and pd.npc ~= npc and tick() - pd.t < 90) then
+                        Quest.setOwner(n, npc, "conversa")
+                    end
                 end
             end
             for n in pairs(before) do
                 if not now[n] then
                     changed = true
                     turnedIn = true
-                    if tryingUnknown[n] then Quest.setOwner(n, npc, "aceitou a entrega") end
+                    if tryingUnknown[n] 
+then Quest.setOwner(n, npc, "aceitou a entrega") end
                 end
             end
             if not changed then break end
             if not Quest.doing(npc) then break end   -- só Auto Claim: entregou, sai
             task.wait(0.3)
         end
+        return true
+    end
+    local hrp
+    local ok, err = pcall(function()
+        -- 1º: fala de longe pelo remote, sem sair do lugar
+        if tick() - (Quest.remoteFail[npc] or 0) > 600 then
+            if not bg then act("Falando com " .. npc .. " de longe") end
+            if session(true) then
+                if not Quest.remoteOk[npc] then Con.log("Info", "Quest " .. npc .. ": falou de longe (próximas em segundo plano)") end
+                Quest.remoteOk[npc] = true
+                return
+            end
+            Quest.remoteFail[npc] = tick()
+            Quest.remoteOk[npc] = nil
+            Con.log("Info", "Quest " .. npc .. ": não respondeu de longe, indo até ele")
+        end
+        if bg then
+            -- em segundo plano não anda: a próxima visita (normal) vai até o urso
+            Quest.cooldown[npc] = nil
+            return
+        end
+        if not (running() and Quest.active(npc)) then return end
+        -- fallback: vai até o urso
+        act("Indo até " .. npc)
+        Move.tween(Quest.standPos(model))
+        hrp = U.hrp()
+        if hrp then hrp.AssemblyLinearVelocity = Vector3.zero hrp.Anchored = true end
+        session(false)
     end)
-    if hrp and hrp.Parent then hrp.Anchored = false end
+    if hrp and hrp.Parent then 
+hrp.Anchored = false end
     if not ok then warn("[BSU] quest:", err) end
     local active, complete = Quest.npcState(npc)
+    if not active and (Quest.gotT[npc] or 0) >= visitT then active = true end
     Quest.retry = Quest.retry or {}
     if active then Quest.retry[npc] = 0 end
     if not active and (Quest.notReady[npc] or 0) > visitT then
@@ -2578,6 +2734,7 @@ responder: tenta mais uma vez
         local cd, pt = Quest.REPEAT_CD[npc], 
 Quest.pickT[npc]
         local untilT = (cd and pt and pt + cd > tick()) and (pt + cd) or (tick() + 60)
+        if (Quest.readyAt[npc] or 0) > tick() then untilT = Quest.readyAt[npc] end
         Quest.blockUntil[npc] = untilT
         Quest.retry[npc] = 0
         Quest.avail[npc] = false
@@ -2587,7 +2744,8 @@ Quest.pickT[npc]
         Quest.retry[npc] = 0
         Quest.avail[npc] = false
         Quest.cooldown[npc] = nil
-    elseif (turnedIn or (Quest.retry[npc] or 0) > 0) and Quest.doing(npc) and not active and not complete then
+    elseif (turnedIn or 
+(Quest.retry[npc] or 0) > 0) and Quest.doing(npc) and not active and not complete then
         -- entregou e não veio quest nova: volta logo pra pegar (até 3 vezes), depois o intervalo normal
         Quest.retry[npc] = (Quest.retry[npc] or 0) + 1
         Quest.avail[npc] = nil   -- o aviso (WarnEvent) pode não ter atualizado ainda
@@ -2595,15 +2753,29 @@ Quest.pickT[npc]
         else Quest.retry[npc] = 0 Quest.cooldown[npc] = tick() + Cfg.QuestInterval end
     elseif complete or next(tryingUnknown) then
         Quest.cooldown[npc] = tick() + 45
+        Quest.claimCD[npc] = tick() + 45
     elseif not active and Quest.avail[npc] ~= true then
-        Quest.cooldown[npc] = tick() + 
-Cfg.QuestInterval
+        Quest.cooldown[npc] = tick() + Cfg.QuestInterval
     end
     Quest.wantT = 0
 end
 function Quest.run()
+    if Quest.bgBusy then return end
     local npc = Quest.next()
-    if npc then Quest.forced[npc] = nil Quest.visit(npc) end
+    if not npc then return end
+    Quest.forced[npc] = nil
+    if Quest.remoteOk[npc] and tick() - (Quest.remoteFail[npc] or 0) > 600 then
+        -- urso que já respondeu de longe: conversa em segundo plano e o farm continua
+        Quest.bgBusy = true
+        task.spawn(function()
+            local ok, err = pcall(Quest.visit, npc, true)
+            if not ok then warn("[BSU] quest bg:", err) end
+            Quest.bgBusy = false
+            Quest.wantT = 0
+        end)
+        return
+    end
+    Quest.visit(npc)
 end
 
 -- mobs que as quests pedem ("Defeat 3 Ladybugs"), só de urso ligado
@@ -2648,8 +2820,7 @@ do
         end
         return nil
     end
-    -- Ursos cujo pólen vem primeiro 
-(Polar Bear: pouco pólen + matar mobs — deixa o pólen pronto)
+    -- Ursos cujo pólen vem primeiro (Polar Bear: pouco pólen + matar mobs — deixa o pólen pronto)
     Quest.POLLEN_FIRST = { "Polar Bear", "Gray Bear" }
     -- Ordem: quests do Polar Bear primeiro, depois as outras. Dentro de cada quest:
     -- 1º objetivos de FIELD específica, depois pólen por COR (na Best <cor> Field).
@@ -2659,8 +2830,7 @@ do
         qf.t, qf.v = tick(), nil
         local list = {}
         for n, q in pairs(Quest.read()) do
-            local owner = 
-Quest.owner[n]
+            local owner = Quest.owner[n]
             if not q.complete and owner and Cfg.QuestNPCs[owner] then
                 local rank = table.find(Quest.POLLEN_FIRST, owner) or 99
                 table.insert(list, { name = n, q = q, rank = rank })
@@ -2670,7 +2840,8 @@ Quest.owner[n]
             if x.rank ~= y.rank then return x.rank < y.rank end
             return x.name < y.name
         end)
-        -- 0) field que alguma quest pede e que está BOOSTADA agora (qualquer boost, mesmo fora
+        -- 0) field que alguma quest 
+pede e que está BOOSTADA agora (qualquer boost, mesmo fora
         --    do Allowed Fields): faz ela antes das outras. Maior x primeiro.
         local boosted = (Boost and Boost.details) and Boost.details() or {}
         local bestB, bestS
@@ -2709,10 +2880,10 @@ Quest.owner[n]
         return nil
     end
 end
--- campos de cada cor (ordem = do pior pro melhor; automático usa o último liberado)
+-- campos de cada cor (ordem = do 
+pior pro melhor; automático usa o último liberado)
 Quest.COLORS = {
-    blue  = { cfg = "BestBlue",  fields 
-= { "Cornflower", "Bamboo", "Pine" } },
+    blue  = { cfg = "BestBlue",  fields = { "Cornflower", "Bamboo", "Pine" } },
     red   = { cfg = "BestRed",   fields = { "Mushroom", "Strawberry", "Rose", "Pitaya" } },
     white = { cfg = "BestWhite", fields = { "Dandelion", "Spider", "Pineapple", "Pumpkin", "Coconut" } },
 }
@@ -2729,7 +2900,8 @@ function Quest.colorOptions(color)
         -- "Spider" = o campo onde nasce o mob Spider (nome do campo não tem "spider")
         if not found and k == "spider" then
             for _, e in ipairs(Mob.entries) do
-                if U.key(e.mob) == "spider" then found = Mob.fieldName(e.field) break end
+                if U.key(e.mob) 
+== "spider" then found = Mob.fieldName(e.field) break end
             end
         end
         if found and not table.find(out, found) then table.insert(out, found) end
@@ -2774,7 +2946,8 @@ end
 -- FIELD BOOSTERS
 --  * usar: ProximityPrompt "Use the Field Booster" -> fireproximityprompt
 --  * resultado: NotificationSent("Basic", 'Activated "Cornflower Field Boost" x3!')
---  * boost ativo: PlayerGui.Main.Buffs."<Campo> Field Boost" (Info.Header = "... (x3)")
+--  * boost ativo: 
+PlayerGui.Main.Buffs."<Campo> Field Boost" (Info.Header = "... (x3)")
 ------------------------------------------------------------------
 Boost = { prompts = {}, nextTry = {}, lastActivated = nil, status = "-", origin = {}, tries = {}, renewing = {}, extended = {} }
 
@@ -2784,7 +2957,8 @@ function F.find(prefix)
     if k == "" then return nil end
     for _, f in ipairs(F.names()) do
         local fk = U.key(f)
-        if fk:sub(1, #k) == k and not (k == "pine" and fk:find("pineapple", 1, true)) then return f end
+        if fk:sub(1, #k) == k and not (k == "pine" and fk:find("pineapple", 1, 
+true)) then return f end
     end
     return nil
 end
@@ -2807,9 +2981,9 @@ Boost.KNOWN = {
 -- acha o prompt de cada booster no mapa (pelo nome do modelo ou pela cor)
 function Boost.scan()
     local all = {}
-    for _, d in ipairs(workspace:GetDescendants()) do
-        if d:IsA("ProximityPrompt") and (d.ActionText .. " " .. d.ObjectTe
-xt):lower():find("booster", 1, true) then
+    for _, d in ipairs(works
+pace:GetDescendants()) do
+        if d:IsA("ProximityPrompt") and (d.ActionText .. " " .. d.ObjectText):lower():find("booster", 1, true) then
             local path = {}
             local cur = d.Parent
             while cur and cur ~= workspace do table.insert(path, U.key(cur.Name)) cur = cur.Parent end
@@ -2817,7 +2991,8 @@ xt):lower():find("booster", 1, true) then
             if not Boost.hooked then Boost.hooked = {} end
             if not Boost.hooked[d] then
                 Boost.hooked[d] = true
-                -- você usou o booster na mão: o boost que vier também conta como "de booster"
+                -- você usou o booster na mão: o boost que vier também 
+conta como "de booster"
                 conn(d.Triggered:Connect(function() Boost.manualAt = tick() end))
             end
         end
@@ -2830,7 +3005,8 @@ xt):lower():find("booster", 1, true) then
         end
         if not found[k.name] then
             for _, e in ipairs(all) do
-                if not used[e] and e.path:find(k.color, 1, true) then found[k.name] = e.pp used[e] = true break end
+                if not used[e] and 
+e.path:find(k.color, 1, true) then found[k.name] = e.pp used[e] = true break end
             end
         end
     end
@@ -2867,7 +3043,8 @@ do  -- seleções antigas (nomes de antes) saem da config
 end
 function Boost.names()
     local t = {}
-    for _, k in ipairs(Boost.KNOWN) do table.insert(t, k.name) end
+    for _, k in ipairs(Boost.KNOWN) 
+do table.insert(t, k.name) end
     return t
 end
 function Boost.pos(pp)
@@ -2881,7 +3058,8 @@ do
     local r = remote("NotificationSent")
     if r then
         conn(r.OnClientEvent:Connect(function(_, text)
-            if type(text) ~= "string" then return end
+            if type(text) ~= "string" then 
+return end
             local field = text:match('Activated "(.-) Field Boost"')
             if field then
                 Boost.lastActivated = { field = field, t = tick(), text = text }
@@ -2894,10 +3072,10 @@ do
             end
             local low = text:lower()
             if low:find("boost", 1, true) then
-                local h, m, s = text:match("(%d+):(%d+):(%d+)")
+                local h, m, s = 
+text:match("(%d+):(%d+):(%d+)")
                 if not h then m, s = text:match("(%d+):(%d+)") end
-                if m then 
-Boost.lastCooldown = { secs = (tonumber(h) or 0) * 3600 + tonumber(m) * 60 + tonumber(s), t = tick() } end
+                if m then Boost.lastCooldown = { secs = (tonumber(h) or 0) * 3600 + tonumber(m) * 60 + tonumber(s), t = tick() } end
             end
         end))
     end
@@ -2908,8 +3086,7 @@ local function parseTime(s)
     s = tostring(s)
     if s:find("Permanent", 1, true) then return math.huge end
     local h, m, sec = s:match("(%d+):(%d+):(%d+)")
-    if h then return tonumber(h) * 3600 + tonumber(m) * 60 + 
-tonumber(sec) end
+    if h then return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(sec) end
     m, sec = s:match("^%s*(%d+):(%d%d)%s*$")
     if m then return tonumber(m) * 60 + tonumber(sec) end
     -- "16h 22m 17s" / "9m 38s" / "45s"
@@ -2940,9 +3117,9 @@ function Boost.details()
             local tm = info and info:FindFirstChild("Time")
             if tm and tm:IsA("TextLabel") then left = parseTime(tm.Text) end
             if stack == 1 then
-                local hd = info and info:FindFirstChild("Header")
-                if hd and hd:IsA("TextLabel") then stack = tonumber(hd.Text:match("%
-(x(%d+)%)")) or stack end
+                local hd = info and 
+info:FindFirstChild("Header")
+                if hd and hd:IsA("TextLabel") then stack = tonumber(hd.Text:match("%(x(%d+)%)")) or stack end
             end
             Boost.seenAt[f] = Boost.seenAt[f] or tick()
             out[f] = { stack = stack, left = left }
@@ -2978,7 +3155,8 @@ function Boost.field()
     if not next(Cfg.BoostFields) then return nil end
     local best, bs
     for f, stack in pairs(Boost.active()) do
-        if Cfg.BoostFields[f] and F.unlocked(f) and stack >= Cfg.MinBoostFarm and (not bs or stack > bs) then best, bs = f, stack end
+        if Cfg.BoostFields[f] and 
+F.unlocked(f) and stack >= Cfg.MinBoostFarm and (not bs or stack > bs) then best, bs = f, stack end
     end
     return best, bs
 end
@@ -2990,8 +3168,7 @@ function Boost.machineKey(n)
     return (n:gsub("%s+%d+$", ""):gsub("%s", ""))
 end
 local BOOST_CD = 30 * 60   -- cooldown dos field boosters: 30 min
--- PlayerData.Cooldowns.<Máquina> 
-(se existir): hora do último uso em ms
+-- PlayerData.Cooldowns.<Máquina> (se existir): hora do último uso em ms
 function Boost.cdLeft(n)
     local f = PD:FindFirstChild("Cooldowns")
     local v = f and f:FindFirstChild(Boost.machineKey(n))
@@ -2999,7 +3176,8 @@ function Boost.cdLeft(n)
     if val and val > 1e11 then return math.max(0, val / 1000 + BOOST_CD - U.serverNow()) end
     return nil
 end
--- Stagger Boosters: depois de um booster que boostou uma Allowed Field, espera 15 min pro próximo.
+-- Stagger Boosters: depois de um booster que boostou uma Allowed 
+Field, espera 15 min pro próximo.
 -- Se o boost caiu fora das Allowed Fields, o próximo pode ser usado na hora.
 Boost.STAGGER = 15 * 60
 Boost.staggerUntil = 0
@@ -3011,7 +3189,8 @@ function Boost.ready()
         if Cfg.Boosters[n] and tick() >= (Boost.nextTry[n] or 0) then
             local cd = Boost.cdLeft(n)
             if cd and cd > 0 then
-                Boost.nextTry[n] = tick() + cd + 2
+                Boost.nextTry[n] = tick() + 
+cd + 2
             else
                 return n, pp
             end
@@ -3019,48 +3198,69 @@ function Boost.ready()
     end
     return nil
 end
+Boost.remoteFail = {}   -- booster -> hora em que usar de longe falhou (aí vai até ele por 10 min)
 function Boost.use(n, pp)
-    if not pp or not pp.Parent then pcall(Boost.scan) pp = Boost.prompts[n] end
-    local pos = (pp and Boost.pos(pp)) or (Boost.where and Boost.where[n])
-    if not pos then
-        Boost.nextTry[n] = tick() + 60
-        Boost.status = n .. ": não achei no mapa (Debug → Copiar boosters)"
-        return
-    end
     St.useTool = false
-    act("Indo usar " .. n)
-    Move.tween(Move.ground(pos + Vector3.new(0, 3, 0), 10, 30), nil, function() return Sched.check() end)
-    if Sched.check() then return end
     local before = Boost.lastActivated and Boost.lastActivated.t or 0
     local cdBefore = Boost.lastCooldown and Boost.lastCooldown.t or 0
-    task.wait(0.3)
-    -- igual ao jogo: Events.UseMachine:FireServer("RedFieldBooster")
-    local um = remote("UseMachine")
-    if um then pcall(function() um:FireServer(Boost.machineKey(n)) end) end
     local function answered()
-        return (Boost.lastActivated and Boost.lastActivated.t > before) 
-or (Boost.lastCooldown and Boost.lastCooldown.t > cdBefore)
+        return (Boost.lastActivated 
+and Boost.lastActivated.t > before) or (Boost.lastCooldown and Boost.lastCooldown.t > cdBefore)
     end
-    local t0 = tick()
-    while tick() - t0 < 2.5 and not answered() do task.wait(0.1) end
-    if not answered() and pp and fireproximityprompt then   -- plano B: o próprio prompt (E)
-        pcall(fireproximityprompt, pp)
-        t0 = tick()
+    -- igual ao jogo: Events.UseMachine:FireServer("RedFieldBooster")
+    local function fire()
+        local um = remote("UseMachine")
+        if um then pcall(function() um:FireServer(Boost.machineKey(n)) end) end
+        local t0 = tick()
         while tick() - t0 < 2.5 and not answered() do task.wait(0.1) end
+        return answered()
+    end
+    -- 1º: de longe pelo remote, sem sair do lugar (igual quest e ticket converter)
+    local remoteOk = false
+    if tick() - (Boost.remoteFail[n] or 0) > 600 then
+        act("Usando " .. n .. " de longe")
+        remoteOk = fire()
+        if remoteOk then
+            Con.log("Info", "Booster " .. n .. ": usado de longe")
+        else
+            Boost.remoteFail[n] = tick()
+            Con.log("Info", "Booster " .. n .. ": não respondeu de longe, indo até ele")
+        end
+    end
+    if not remoteOk then
+        -- fallback: vai até o booster
+        if not pp or not pp.Parent then pcall(Boost.scan) pp = Boost.prompts[n] end
+        local pos = (pp and Boost.pos(pp)) or (Boost.where and Boost.where[n])
+        if not pos then
+            Boost.nextTry[n] = tick() + 60
+            Boost.status = n .. ": não achei no mapa (Debug → Copiar boosters)"
+            return
+        end
+        act("Indo usar " .. n)
+        Move.tween(Move.ground(pos + Vector3.new(0, 3, 0), 10, 30), nil, function() return Sched.check() end)
+        if Sched.check() then return end
+        task.wait(0.3)
+        if not fire() and pp and fireproximityprompt then   -- plano 
+B: o próprio prompt (E)
+            pcall(fireproximityprompt, pp)
+            local t0 = tick()
+            while tick() - t0 < 2.5 and not answered() do task.wait(0.1) end
+        end
     end
     if Boost.lastActivated and Boost.lastActivated.t > before then
         local f = Boost.lastActivated.field
         local mine = F.find(f)
-        Boost.status = 
-string.format("%s: boostou %s", n, f) .. ((mine and Cfg.BoostFields[mine]) and " (na sua lista: indo farmar)" or " (fora da lista)")
-        if mine then Boost.origin[mine] = tick() end   -- boost que veio de booster (pode renovar com dado/glitter)
+        Boost.status = string.format("%s: boostou %s", n, f) .. ((mine and Cfg.BoostFields[mine]) and " (na sua lista: indo farmar)" or " (fora da lista)")
+        if mine then Boost.origin[mine] 
+= tick() end   -- boost que veio de booster (pode renovar com dado/glitter)
         Boost.nextTry[n] = tick() + BOOST_CD + 5
         if mine and Cfg.BoostFields[mine] then Boost.staggerUntil = tick() + Boost.STAGGER end
     elseif Boost.lastCooldown and Boost.lastCooldown.t > cdBefore then
         Boost.nextTry[n] = tick() + Boost.lastCooldown.secs + 5
         Boost.status = string.format("%s: em espera (%s)", n, U.fmtTime(Boost.lastCooldown.secs))
     else
-        Boost.nextTry[n] = tick() + 3 * 60      -- não respondeu: tenta de novo em 3 min
+        Boost.nextTry[n] = tick() + 3 
+* 60      -- não respondeu: tenta de novo em 3 min
         Boost.status = n .. " (" .. Boost.machineKey(n) .. "): sem resposta, tentando de novo em 3 min"
     end
 end
@@ -3068,8 +3268,7 @@ function Boost.statusText()
     local parts = {}
     for f, d in pairs(Boost.details()) do
         local t = d.left and (" " .. U.fmtTime(d.left))
-            or (Boost.seenAt[f] and (" 
-(ativo há " .. U.fmtTime(tick() - Boost.seenAt[f]) .. ")") or "")
+            or (Boost.seenAt[f] and (" (ativo há " .. U.fmtTime(tick() - Boost.seenAt[f]) .. ")") or "")
         table.insert(parts, U.fname(f) .. " x" .. d.stack .. t .. (Cfg.BoostFields[f] and " ★" or ""))
     end
     table.sort(parts)
@@ -3080,8 +3279,7 @@ function Boost.statusText()
             table.insert(cds, n .. ": " .. (left > 0 and U.fmtTime(left) or "pronto"))
         end
     end
-    return "Boosts ativos: " .. (#parts > 0 and table.concat(parts, ", ") or 
-"nenhum")
+    return "Boosts ativos: " .. (#parts > 0 and table.concat(parts, ", ") or "nenhum")
         .. "\nBoosters: " .. (#cds > 0 and table.concat(cds, " | ") or "nenhum ligado")
         .. "\nÚltimo: " .. Boost.status
 end
@@ -3092,12 +3290,12 @@ end
 ------------------------------------------------------------------
 local Inv = {}
 function Inv.find(name)
-    local f = 
-PD:FindFirstChild("Inventory")
+    local f = PD:FindFirstChild("Inventory")
     if not f then return nil end
     local k = U.key(name)
     for _, c in ipairs(f:GetChildren()) do
-        if U.key(c.Name) == k or U.key(c:GetAttribute("Name") or "") == k then return c end
+        if U.key(c.Name) == k or 
+U.key(c:GetAttribute("Name") or "") == k then return c end
     end
     for _, c in ipairs(f:GetChildren()) do   -- Enzyme / Enzymes
         local ck = U.key(c.Name)
@@ -3105,12 +3303,12 @@ PD:FindFirstChild("Inventory")
     end
     return nil
 end
-function Inv.count(name) local c = Inv.find(name) return c and c.Value 
-or 0 end
+function Inv.count(name) local c = Inv.find(name) return c and c.Value or 0 end
 function Inv.ready(name)
     local c = Inv.find(name)
     if not c or c.Value <= 0 then return false end
-    local last = tonumber(c:GetAttribute("LastUse")) or 0
+    local last = tonumber(c:G
+etAttribute("LastUse")) or 0
     local cd = tonumber(c:GetAttribute("Cooldown")) or 0
     return U.serverNow() * 1000 >= last + cd
 end
@@ -3128,11 +3326,11 @@ end
 ------------------------------------------------------------------
 -- RENOVAR O BOOST com Glitter / Field Dice
 -- Só quando o boost QUE VEIO DO BOOSTER está acabando (Min Time Left).
--- Glitter boosta a field onde você está (garantido); o dado cai numa 
-field aleatória.
+-- Glitter boosta a field onde você está (garantido); o dado cai numa field aleatória.
 ------------------------------------------------------------------
 function Boost.renewTarget()
-    if not Cfg.AutoBooster or not (Cfg.UseGlitter or Cfg.UseDice) then return nil end
+    if not Cfg.AutoBooster or not (Cfg.UseGlitter or Cfg.UseDice) then 
+return nil end
     local det = Boost.details()
     -- boost que acabou: limpa o estado (senão a próxima renovação fica travada)
     for rf in pairs(Boost.renewing) do if not det[rf] then Boost.renewing[rf] = nil Boost.tries[rf] = 0 end end
@@ -3142,7 +3340,8 @@ function Boost.renewTarget()
     local d = det[f]
     if not d or not d.left then return nil end
     if Cfg.RequireBooster and not Boost.origin[f] then return nil end
-    -- "Estender só uma vez": já renovou esse boost (desde o último booster)? então para
+    -- "Estender só uma vez": já 
+renovou esse boost (desde o último booster)? então para
     if Cfg.ExtendOnce and Boost.extended[f] and Boost.extended[f] == (Boost.origin[f] or 0) then
         Boost.renewing[f] = nil
         return nil
@@ -3197,12 +3396,12 @@ function Boost.renew()
 end
 
 ------------------------------------------------------------------
--- AUTO MATERIALS: usa cada item a cada X (Matter só dentro de uma 
-field)
+-- AUTO MATERIALS: usa cada item a cada X (Matter só dentro de uma field)
 ------------------------------------------------------------------
 local Mat = { last = {}, status = "-" }
 Mat.LIST = {
-    { name = "Red Extract", unit = 60, def = 10 },
+    { name = "Red Extract", unit = 60, 
+def = 10 },
     { name = "Blue Extract", unit = 60, def = 10 },
     { name = "Enzyme", unit = 60, def = 10 },
     { name = "Oil", unit = 60, def = 10 },
@@ -3210,8 +3409,7 @@ Mat.LIST = {
     { name = "Matter", unit = 1, def = 2, field = true },
 }
 function Mat.cfg(name)
-    if type(Cfg.Mats) ~= "table" then 
-Cfg.Mats = {} end
+    if type(Cfg.Mats) ~= "table" then Cfg.Mats = {} end
     local c = Cfg.Mats[name]
     if type(c) ~= "table" then c = {} Cfg.Mats[name] = c end
     if type(c.on) ~= "boolean" then c.on = false end
@@ -3228,7 +3426,8 @@ task.spawn(function()
         if Cfg.AutoMaterials and U.alive() then
             for _, m in ipairs(Mat.LIST) do
                 local c = Mat.cfg(m.name)
-                if c.on and tick() - (Mat.last[m.name] or -1e9) >= c.interval * m.unit and Inv.ready(m.name) then
+                if c.on and tick() - 
+(Mat.last[m.name] or -1e9) >= c.interval * m.unit and Inv.ready(m.name) then
                     local okHere = true
                     if m.field then
                         local hrp = U.hrp()
@@ -3249,8 +3448,7 @@ function Mat.statusText()
         local c = Mat.cfg(m.name)
         local left = c.on and math.max(0, c.interval * m.unit - (tick() - (Mat.last[m.name] or -1e9))) or nil
         table.insert(t, string.format("%s: %d%s", m.name, Inv.count(m.name),
-            c.on and (" | próximo " .. (left 
-> 0 and U.fmtTime(left) or "agora")) or ""))
+            c.on and (" | próximo " .. (left > 0 and U.fmtTime(left) or "agora")) or ""))
     end
     return table.concat(t, "\n") .. "\nÚltimo: " .. Mat.status
 end
@@ -3259,8 +3457,7 @@ end
 -- TICKET CONVERTERS (Workspace.Machines.InstantConverter1..3): gasta 1 Medal e converte a bolsa inteira.
 --  * usar: Events.UseMachine:FireServer("InstantConverter1") perto da plataforma (prompt alcance 14)
 --  * confirmação: NotificationSent "... Honey (From Instant Converter)"
---  * cooldown: 5 min, PlayerData.Co
-oldowns.InstantConverterN = hora do último uso (ms)
+--  * cooldown: 5 min, PlayerData.Cooldowns.InstantConverterN = hora do último uso (ms)
 ------------------------------------------------------------------
 TConv = { status = "-", nextTry = {}, okT = 0 }
 TConv.CD = 5 * 60
@@ -3279,8 +3476,7 @@ function TConv.list()
             local pp = c:FindFirstChildWhichIsA("ProximityPrompt", true)
             local part = pp and pp.Parent
             local pos = (part and part:IsA("BasePart") and part.Position) or (part and part:IsA("Attachment") and part.WorldPosition) or c:GetPivot().Position
-            table.insert(out, { name = 
-c.Name, pp = pp, pos = pos })
+            table.insert(out, { name = c.Name, pp = pp, pos = pos })
         end
     end
     return out
@@ -3291,8 +3487,7 @@ function TConv.cdLeft(name)
     local val = v and tonumber(v.Value)
     -- cooldown custom (mín. 5 min do jogo): espaça os usos pra gastar menos Medal
     local cd = math.max(TConv.CD, (tonumber(Cfg.ConverterCD) or 5) * 60)
-    if val and val > 1e11 then return math.max(0, val / 1000 + cd - 
-U.serverNow()) end
+    if val and val > 1e11 then return math.max(0, val / 1000 + cd - U.serverNow()) end
     return 0
 end
 -- converter pronto mais perto (com Medal)
@@ -3309,23 +3504,31 @@ function TConv.ready()
     end
     return best
 end
-function TConv.use(c)
-    St.useTool = false
+-- remoteOnly: só tenta de longe (Stop Everything ligado: não mexe 
+o personagem)
+function TConv.use(c, remoteOnly)
+    if not remoteOnly then St.useTool = false end
     -- funciona DE LONGE (testado): dispara daqui e confere pelo Medal/notificação. Só viaja se não der.
     local um = remote("UseMachine")
     local medal0 = Inv.count("Medal")
     local t = tick()
     act("Usando " .. c.name .. " de longe")
     if um then pcall(function() um:FireServer(c.name) end) end
-    while tick() - t < 2.5 and TConv.okT < t and Inv.count("Medal") >= medal0 do 
-task.wait(0.1) end
-    if TConv.okT >= t or Inv.count("Medal") < medal0 then
+    while tick() - t < 2.5 and TConv.okT < t and Inv.count("Medal") >= medal0 do task.wait(0.1) end
+    if TConv.okT >= t or 
+Inv.count("Medal") < medal0 then
         TConv.status = c.name .. " usado de longe " .. os.date("%H:%M:%S") .. " | Medal: " .. Inv.count("Medal")
         TConv.nextTry[c.name] = tick() + math.max(TConv.CD, (tonumber(Cfg.ConverterCD) or 5) * 60) + 2
         return true
     end
+    if remoteOnly then
+        TConv.nextTry[c.name] = tick() + 30
+        TConv.status = c.name .. ": não converteu de longe"
+        return false
+    end
     act("Indo pro " .. c.name)
-    Move.tween(Move.ground(c.pos + Vector3.new(0, 3, 0), 10, 30), nil, function() return Sched.check() end)
+    Move.tween(Move.ground(c.pos 
++ Vector3.new(0, 3, 0), 10, 30), nil, function() return Sched.check() end)
     if Sched.check() then return false end
     task.wait(0.3)
     local t = tick()
@@ -3359,8 +3562,7 @@ end
 -- cooldown do jogo: 3s (Inv.ready). Cooldown custom em minutos + quantos guardar no inventário.
 local Micro = { status = "-", last = -1e9 }
 function Micro.cdLeft()
-    return math.max(0, (tonumber(Cfg.MicroCD) or 0) * 60 - 
-(tick() - Micro.last))
+    return math.max(0, (tonumber(Cfg.MicroCD) or 0) * 60 - (tick() - Micro.last))
 end
 function Micro.ready()
     if not Cfg.UseMicroConverters then return false end
@@ -3382,21 +3584,36 @@ function Micro.use()
     return false
 end
 function Micro.statusText()
-    local n, keep = Inv.count("Micro Converter"), math.floor(tonumber(Cfg.MicroKeep) or 0)
+    local n, keep = Inv.count("Micro 
+Converter"), math.floor(tonumber(Cfg.MicroKeep) or 0)
     local extra = ""
-    if n <= keep then extra = " | 
-guardando (limite " .. keep .. ")"
+    if n <= keep then extra = " | guardando (limite " .. keep .. ")"
     elseif Micro.cdLeft() > 0 then extra = " | próximo em " .. U.fmtTime(Micro.cdLeft()) end
     return "Micro Converter: " .. n .. extra .. "\n" .. Micro.status
 end
 
+-- STOP EVERYTHING ligado: Ticket Converter (de longe) e Micro Converter continuam funcionando
+task.spawn(function()
+    while running() do
+        task.wait(1)
+        if Cfg.StopEverything 
+and Cfg.AutoConvert and U.alive() and U.bagPct() * 100 >= Cfg.ConvertPercent then
+            pcall(function()
+                local c = TConv.ready()
+                if c and TConv.use(c, true) then return end
+                if Micro.ready() then Micro.use() end
+            end)
+        end
+    end
+end)
+
 ------------------------------------------------------------------
 -- WEBHOOK (Discord)
 ------------------------------------------------------------------
-Hook.queue, Hook.items, Hook.status = {}, {}, "parado"
+Hook.queue, Hook.items, 
+Hook.status = {}, {}, "parado"
 Hook.req = (syn and syn.request) or (http and http.request) or http_request or (fluxus and fluxus.request) or request
-function Hook.push(title, desc, 
-color, fields, ping)
+function Hook.push(title, desc, color, fields, ping)
     if not Cfg.WebhookOn or Cfg.WebhookURL == "" then return end
     local content = nil
     if ping and Cfg.WebhookPing ~= "" then content = "<@" .. Cfg.WebhookPing .. ">" end
@@ -3416,11 +3633,11 @@ function Hook.post(payload, url)
     if url == "" then Hook.status = "sem URL" return false end
     local ok, res = pcall(Hook.req, {
         Url = url, Method = "POST",
-        Headers = { ["Content-Type"] = "application/json" },
+        Headers = { ["Content-Type"] = 
+"application/json" },
         Body = Http:JSONEncode(payload),
     })
-    if ok and type(res) == "table" and res.StatusCode and res.StatusCode 
->= 300 then
+    if ok and type(res) == "table" and res.StatusCode and res.StatusCode >= 300 then
         Hook.status = "erro HTTP " .. tostring(res.StatusCode)
         return false
     end
@@ -3440,7 +3657,8 @@ Hook.CATS = {
         return k:find("treat") or k:find("berr") or k:find("pineapple") or k:find("strawberr")
             or k:find("sunflowerseed") or k:find("seed")
       end },
-    { "Waxes",  function(k) return k:find("wax") end },
+    { "Waxes",  function(k) return 
+k:find("wax") end },
     { "Rares",  function(k)
         return k:find("extract") or k:find("enzyme") or k:find("oil") or k:find("glitter") or k:find("magicbean")
             or k:find("glue") or k:find("matter") or k:find("microconverter") or k:find("tropicaldrink")
@@ -3464,7 +3682,8 @@ end
 -- últimas N linhas do console (bloco de código, cabe no limite do Discord)
 function Hook.consoleText(n)
     local t = {}
-    for _, l in ipairs(Con.tail(n)) do table.insert(t, #l > 110 and (l:sub(1, 107) .. "...") or l) end
+    for _, l in ipairs(Con.tail(n)) do table.insert(t, #l > 110 and (l:sub(1, 
+107) .. "...") or l) end
     if #t == 0 then return "" end
     local body = table.concat(t, "\n"):gsub("`", "'")
     if #body > 1900 then body = body:sub(-1900) end
@@ -3477,12 +3696,12 @@ function Hook.itemsText()
     for name, v in pairs(Hook.sessionItems()) do
         local k = U.key(name)
         local cat = "Others"
-        for _, c in ipairs(Hook.CATS) do if c[2](k) then cat = c[1] break end end
+        for _, c in ipairs(Hook.CATS) do if c[2](k) then cat = c[1] break end 
+end
         table.insert(groups[cat], { name, v })
     end
     local parts = {}
-    for _, cat in ipairs({ "Eggs", 
-"Treats", "Waxes", "Rares", "Others" }) do
+    for _, cat in ipairs({ "Eggs", "Treats", "Waxes", "Rares", "Others" }) do
         local g = groups[cat]
         if #g > 0 then
             table.sort(g, function(x, y) return x[1] < y[1] end)
@@ -3501,19 +3720,19 @@ function Hook.statsFields()
     return {
         { name = "Mel", value = U.short(U.honey()), inline = true },
         { name = "Ganho na sessão", value = U.short(gained), inline = true },
-        { name = "Honey Per Hour", value = U.short(gained / hours), inline = true },
+        { name = "Honey Per Hour", 
+value = U.short(gained / hours), inline = true },
         { name = "Tempo", value = U.fmtTime(tick() - St.startT), inline = true },
-        { name = "Pólen", 
-value = string.format("%s / %s", U.short(U.pollen()), U.short(U.cap())), inline = true },
+        { name = "Pólen", value = string.format("%s / %s", U.short(U.pollen()), U.short(U.cap())), inline = true },
         { name = "Quests entregues", value = tostring(St.quests), inline = true },
         { name = "Mobs mortos", value = tostring(St.kills), inline = true },
         { name = "Tarefa", value = St.task .. (St.reason ~= "" and (" — " .. St.reason) or ""), inline = false },
     }
 end
-function Hook.stats() Hook.push("📊 Status", "__Itens na sessão__\n" .. Hook.itemsText(), 0x2F5AA0, Hook.statsFields()) end
+function Hook.stats() 
+Hook.push("📊 Status", "__Itens na sessão__\n" .. Hook.itemsText(), 0x2F5AA0, Hook.statsFields()) end
 function Hook.questDone(name, owner)
-    if Cfg.WebhookQuests then 
-Hook.push("✅ Quest entregue", string.format("**%s** (%s)", name, owner or "urso ?"), 0x3BA55C) end
+    if Cfg.WebhookQuests then Hook.push("✅ Quest entregue", string.format("**%s** (%s)", name, owner or "urso ?"), 0x3BA55C) end
 end
 function Hook.test()
     return Hook.post({ content = "Teste do BSU v" .. VERSION .. " (" .. LP.Name .. ")" })
@@ -3525,18 +3744,17 @@ task.spawn(function()   -- envia a fila (1 a cada 1.5s, respeita o limite do Dis
         if p then Hook.post(p) end
     end
 end)
--- BUFF UPTIME: lê os buffs da 
-tela a cada 10s (leve) e manda um gráfico da última hora pro webhook.
+-- BUFF UPTIME: lê os buffs da tela a cada 10s (leve) e manda um gráfico da última hora pro webhook.
 -- O gráfico é gerado pelo QuickChart (um POST por envio, fora do jogo).
 local Uptime = { samples = {}, status = "-" }
 Uptime.BUFFS = {
     { name = "Calmness",    color = "#b8b8c8" },
     { name = "Focus",       color = "#39d353" },
-    { name = "Motivation",  color = "#c792ea" },
+    { name = "Motivation",  color = 
+"#c792ea" },
     { name = "Blue Boost",  color = "#4f8ef7" },
     { name = "Red Boost",   color = "#f25f5c" },
-    { name = "White Boost", color = 
-"#f0f0f0" },
+    { name = "White Boost", color = "#f0f0f0" },
     { name = "Bomb Combo",  color = "#cfcfcf" },
 }
 Uptime.icons = {}   -- [buff] = id da imagem (pro painel do BSU Stats)
@@ -3549,13 +3767,13 @@ function Uptime.read()
             if U.key(b.Name) == U.key(d.name) then
                 local stack = 1
                 local st = b:FindFirstChild("Stack")
-                if st and 
-st:IsA("TextLabel") then stack = tonumber(st.Text:match("x(%d+)")) or 1 end
+                if st and st:IsA("TextLabel") then stack = tonumber(st.Text:match("x(%d+)")) or 1 end
                 if not Uptime.icons[d.name] then
                     local img = (b:IsA("ImageLabel") or b:IsA("ImageButton")) and b.Image or nil
                     if not img or img == "" then
                         for _, c in ipairs(b:GetDescendants()) do
-                            if (c:IsA("ImageLabel") or c:IsA("ImageButton")) and c.Image ~= "" and not c:FindFirstAncestor("Info") then img = c.Image break end
+                            if 
+(c:IsA("ImageLabel") or c:IsA("ImageButton")) and c.Image ~= "" and not c:FindFirstAncestor("Info") then img = c.Image break end
                         end
                     end
                     local id = img and tostring(img):match("%d+")
@@ -3563,7 +3781,8 @@ st:IsA("TextLabel") then stack = tonumber(st.Text:match("x(%d+)")) or 1 end
                 end
                 local hd = b:FindFirstChild("Info") and b.Info:FindFirstChild("Header")
                 if stack == 1 and hd and hd:IsA("TextLabel") then stack = tonumber(hd.Text:match("%(x(%d+)%)")) or 1 end
-                out[d.name] = math.max(out[d.name] or 0, stack)
+                out[d.name] = 
+math.max(out[d.name] or 0, stack)
             end
         end
     end
@@ -3575,12 +3794,12 @@ Uptime.cats = { gather = 0, convert = 0, other = 0 }
 function Uptime.cat()
     local cur = Sched.cur and Sched.cur.name
     if cur == "Convert" then return "convert" end
-    if cur ~= "Farm" then return "other" end
+    if cur ~= "Farm" then return 
+"other" end
     local hrp = U.hrp()
     local f = hrp and F.of(hrp.Position)
     if not f then return "other" end
-    if Sprout.looting() and f == 
-Sprout.lootField then return "other" end
+    if Sprout.looting() and f == Sprout.lootField then return "other" end
     if Sprout.cur and f == Sprout.field then return "other" end
     return "gather"
 end
@@ -3591,19 +3810,18 @@ task.spawn(function()
         Uptime.cats[cat] += 10
         local okP, pol, cap = pcall(function() return U.pollen(), U.cap() end)
         table.insert(Uptime.samples, { t = os.time(), v = ok and v or {}, honey = U.honey(), pollen = okP and pol or 0, cap = okP and cap or 0, cat = cat })
-        while #Uptime.samples 
-> 0 and os.time() - Uptime.samples[1].t > 3600 do table.remove(Uptime.samples, 1) end
+        while #Uptime.samples > 0 and os.time() - Uptime.samples[1].t > 3600 do table.remove(Uptime.samples, 1) end
         task.wait(10)
     end
 end)
 -- RELATÓRIO COMPLETO (BSU Stats no Render): manda a última hora pro servidor, que desenha o painel e posta no webhook
 local Stats = { status = "-" }
 function Stats.send()
-    if not Hook.req then Stats.status = "executor sem request" return end
+    if not Hook.req then Stats.status = 
+"executor sem request" return end
     local base = (Cfg.StatsURL or ""):gsub("/+$", "")
     if base == "" then Stats.status = "sem URL do servidor" return end
-    if #Uptime.samples < 3 then 
-Stats.status = "poucos dados ainda (espere 1 min)" return end
+    if #Uptime.samples < 3 then Stats.status = "poucos dados ainda (espere 1 min)" return end
     Stats.status = "acordando o servidor..."
     -- o Render grátis dorme: um GET acorda (pode levar ~1 min)
     for _ = 1, 4 do
@@ -3614,13 +3832,13 @@ Stats.status = "poucos dados ainda (espere 1 min)" return end
     local samples, buffs = {}, {}
     for _, d in ipairs(Uptime.BUFFS) do table.insert(buffs, d.name) end
     for _, x in ipairs(Uptime.samples) do
-        table.insert(samples, { t = x.t, honey = x.honey or 0, pollen = 
-x.pollen or 0, cap = x.cap or 0, cat = x.cat or "other", buffs = x.v })
+        table.insert(samples, { t = x.t, honey = x.honey or 0, pollen = x.pollen or 0, cap = x.cap or 0, cat = x.cat or "other", buffs = x.v })
     end
     local body = {
         secret = Cfg.StatsSecret, webhook = (Cfg.GraphWebhookURL ~= "" and Cfg.GraphWebhookURL or Cfg.WebhookURL), player = LP.Name, version = VERSION, ping = Cfg.WebhookPing ~= "" and Cfg.WebhookPing or nil,
         buffs = buffs, samples = samples, icons = Uptime.icons,
-        session = { honey = U.honey() - St.startHoney, time = tick() - St.startT, cats = Uptime.cats },
+        session = { honey = U.honey() 
+- St.startHoney, time = tick() - St.startT, cats = Uptime.cats },
         stats = { kills = St.kills, quests = St.quests, hits = St.hits },
     }
     Stats.status = "enviando..."
@@ -3641,11 +3859,11 @@ task.spawn(function()   -- status periódico
     end
 end)
 do  -- itens ganhos: NotificationSent("+2 Enzyme (From Spider)")
-    local r = remote("NotificationSent")
+    local r = 
+remote("NotificationSent")
     if r then
         conn(r.OnClientEvent:Connect(function(_, text)
-            if type(text) ~= "string" then 
-return end
+            if type(text) ~= "string" then return end
             local n, item = text:match("^%+%s*([%d,]+)%s+(.-)%s*%(")
             if not n then n, item = text:match("^%+%s*([%d,]+)%s+(.+)$") end
             if not item then return end
@@ -3654,8 +3872,7 @@ return end
             if k == "" or k == "honey" or k == "pollen" then return end
             local cnt = tonumber((n:gsub(",", ""))) or 1
             Hook.items[item] = (Hook.items[item] or 0) + cnt
-            if U.match(UNIQUE_ITEMS, item) and Cfg.WebhookItems then Hook.push("🎁 Item", text, 0xF1C40F, nil, false) end   -- sem 
-menção
+            if U.match(UNIQUE_ITEMS, item) and Cfg.WebhookItems then Hook.push("🎁 Item", text, 0xF1C40F, nil, false) end   -- sem menção
         end))
     end
     -- inventário completo (se o jogo mandar como tabela nome -> quantidade)
@@ -3664,11 +3881,11 @@ menção
         local function scan(t, depth)
             if type(t) ~= "table" or depth > 3 then return end
             for k, v in pairs(t) do
-                if type(k) == "string" and type(v) == "number" then
+                if type(k) == "string" and 
+type(v) == "number" then
                     local name = Hook.itemName(k)
                     Hook.inv[name] = v
-                    if Hook.invStart[name] == nil then Hook.invStart[name] = v 
-end
+                    if Hook.invStart[name] == nil then Hook.invStart[name] = v end
                 elseif type(v) == "table" then
                     scan(v, depth + 1)
                 end
@@ -3678,12 +3895,12 @@ end
             if type(t) ~= "table" or depth > 3 then return 0 end
             local n = 0
             for k, v in pairs(t) do
-                if type(k) == "string" and type(v) == "number" then n += 1 elseif type(v) == "table" then n += count(v, depth + 1) end
+                if type(k) == "string" and type(v) == "number" then n += 1 
+elseif type(v) == "table" then n += count(v, depth + 1) end
             end
             return n
         end
-        conn(inv.OnClientEvent:Conne
-ct(function(...)
+        conn(inv.OnClientEvent:Connect(function(...)
             for _, a in ipairs({ ... }) do
                 -- só confia na diferença se já chegou um inventário completo (10+ itens)
                 if not Hook.invFull and count(a, 0) >= 10 then
@@ -3717,11 +3934,11 @@ do
     end
     local GuiService = game:GetService("GuiService")
     pcall(function()
-        conn(GuiService.ErrorMessageChanged:Connect(function(m) if m and m ~= "" then onDisconnect(m) end end))
+        conn(GuiService.ErrorMessageChanged:Connect(function(m) if m and m ~= "" then onDisconnect(m) 
+end end))
     end)
     task.spawn(pcall, function()
-        local overlay = game:GetService("CoreGui"):WaitForChild("RobloxPromptGui", 
-5)
+        local overlay = game:GetService("CoreGui"):WaitForChild("RobloxPromptGui", 5)
         overlay = overlay and overlay:WaitForChild("promptOverlay", 5)
         if overlay then
             conn(overlay.ChildAdded:Connect(function(c)
@@ -3759,8 +3976,7 @@ local DefaultWS = nil
 conn(RunService.Heartbeat:Connect(function()
     local hum = U.hum()
     if not hum then return end
-    -- durante a luta usa a velocidade 
-normal do jogo (com WalkSpeed alto o mob ataca mais)
+    -- durante a luta usa a velocidade normal do jogo (com WalkSpeed alto o mob ataca mais)
     if Cfg.WalkSpeedOn and not Fight.active then
         if not DefaultWS then DefaultWS = hum.WalkSpeed end
         if hum.WalkSpeed ~= Cfg.WalkSpeed then hum.WalkSpeed = Cfg.WalkSpeed end
@@ -3779,7 +3995,8 @@ end))
 
 ------------------------------------------------------------------
 -- AUTO SPRINKLER: Events.SetupSprinkler:FireServer(Vector3 no chão)
---  Basic / Star Saturator: 1 no centro | Silver (2) / Golden (3): linha reta centralizada
+--  Basic / Star Saturator: 1 no centro | Silver (2) / Golden (3): linha reta 
+centralizada
 --  Diamond (4): quadrado em volta do centro
 ------------------------------------------------------------------
 local Spr = { field = nil, status = "-" }
@@ -3788,10 +4005,10 @@ Spr.TYPES = {
     ["Silver Soakers"]     = { count = 2, radius = 7,  setup = 5, shape = "line" },
     ["Golden Gushers"]     = { count = 3, radius = 8,  setup = 5, shape = "line" },
     ["Diamond Drenchers"]  = { count = 4, radius = 8,  setup = 4, shape = "square" },
-    ["Star Saturator"]     = { count = 1, radius = 16, setup = 3, shape = "center" },
+    ["Star Saturator"]     = { count = 
+1, radius = 16, setup = 3, shape = "center" },
 }
-Spr.ORDER = { "Basic Sprinkler", "Silver Soakers", "Golden Gushers", "Diamond Drenchers", "Star 
-Saturator" }
+Spr.ORDER = { "Basic Sprinkler", "Silver Soakers", "Golden Gushers", "Diamond Drenchers", "Star Saturator" }
 if not Spr.TYPES[Cfg.Sprinkler] then Cfg.Sprinkler = "Basic Sprinkler" end   -- config antiga ("Automático")
 function Spr.current()
     if Spr.TYPES[Cfg.Sprinkler] then return Cfg.Sprinkler end
@@ -3800,7 +4017,8 @@ end
 -- posições (no chão) conforme o tipo
 function Spr.points(hb, name)
     local t = Spr.TYPES[name]
-    local gap = t.radius * 2.3   -- distância entre os sprinklers
+    local gap = t.radius * 2.3   -- 
+distância entre os sprinklers
     local long = hb.Size.X >= hb.Size.Z   -- linha no eixo mais comprido do campo
     local offs = {}
     if t.shape == "center" then
@@ -3818,8 +4036,7 @@ function Spr.points(hb, name)
     local ex = F.extra(hb)
     for _, o in ipairs(offs) do
         if ex > 0 then   -- borda proibida (ex.: Rose): puxa pra dentro
-            local hx, hz = hb.Size.X / 2 - 
-ex, hb.Size.Z / 2 - ex
+            local hx, hz = hb.Size.X / 2 - ex, hb.Size.Z / 2 - ex
             o = { math.clamp(o[1], -hx, hx), math.clamp(o[2], -hz, hz) }
         end
         local w = F.toWorld(hb, o[1], o[2])
@@ -3842,8 +4059,7 @@ function Spr.place(field, hb)
         task.wait(0.3)   -- o setup é só o tempo pra começar a regar: não precisa esperar
     end
     Spr.field = field
-    Spr.status = string.format("%s 
-colocado em %s (%s)", name, U.fname(field), os.date("%H:%M:%S"))
+    Spr.status = string.format("%s colocado em %s (%s)", name, U.fname(field), os.date("%H:%M:%S"))
 end
 
 ------------------------------------------------------------------
@@ -3860,19 +4076,19 @@ end
 function Bean.want()
     if not (Cfg.BeanOn and Cfg.AutoSprout) or Cfg.BeanField == "" then return nil end
     if Bean.planted >= Cfg.BeanCount then return nil end
-    if U.bagPct() > 0.85 then return nil end   -- bolsa acima de 85%: não planta (converte antes)
+    if U.bagPct() > 0.85 then return nil end   -- bolsa acima de 85%: não 
+planta (converte antes)
     if not F.unlocked(Cfg.BeanField) then return nil end
     if tick() - Bean.lastTry < 5 then return nil end
-    if Inv.count("Magic Bean") <= 0 or 
-not Inv.ready("Magic Bean") then return nil end
+    if Inv.count("Magic Bean") <= 0 or not Inv.ready("Magic Bean") then return nil end
     Sprout.update()
     if Sprout.cur then return nil end                       -- ainda quebrando uma
     if sproutIn(Cfg.BeanField) then return nil end           -- já tem sprout viva lá
     if Sprout.looting() and tick() - (Sprout.lootStart or 0) < (tonumber(Cfg.BeanDelay) or 10) then return nil end   -- espera X s de loot antes
-    return string.format("plantar sprout %d/%d em %s", Bean.planted + 1, Cfg.BeanCount, U.fname(Cfg.BeanField))
+    return string.format("plantar 
+sprout %d/%d em %s", Bean.planted + 1, Cfg.BeanCount, U.fname(Cfg.BeanField))
 end
--- plantando sprouts (sessão do Magic Bean): enquanto tiver sprout 
-pra plantar/quebrar/lootear,
+-- plantando sprouts (sessão do Magic Bean): enquanto tiver sprout pra plantar/quebrar/lootear,
 -- não sai pra matar mob, quest, booster etc. Só colmeia, conversão e token raro DENTRO da field.
 function Bean.active()
     if not (Cfg.BeanOn and Cfg.AutoSprout) or Cfg.BeanField == "" then return false end
@@ -3882,8 +4098,7 @@ function Bean.active()
     return false
 end
 Sched.beanActive = Bean.active
-local BEAN_BLOCK = { Quest = 
-true, Booster = true, Renew = true, QuestMob = true, Kill = true }
+local BEAN_BLOCK = { Quest = true, Booster = true, Renew = true, QuestMob = true, Kill = true }
 function Sched.blocked(t)
     if not Bean.active() then return false end
     if BEAN_BLOCK[t.name] then return true end
@@ -3897,8 +4112,7 @@ end
 function Bean.plant()
     local field = Cfg.BeanField
     local hb = F.hb(field)
-    if not hb then Bean.status = "field 
-não encontrada" Bean.lastTry = tick() return end
+    if not hb then Bean.status = "field não encontrada" Bean.lastTry = tick() return end
     local hrp = U.hrp()
     if not F.inside(hb, hrp.Position) then
         act("Indo plantar Magic Bean em " .. U.fname(field))
@@ -3918,7 +4132,8 @@ não encontrada" Bean.lastTry = tick() return end
     end
     Bean.lastTry = tick()
     act("Plantando Magic Bean")
-    if not Inv.use("Magic Bean") then Bean.status = "não consegui usar o Magic Bean" return end
+    if not Inv.use("Magic Bean") then 
+Bean.status = "não consegui usar o Magic Bean" return end
     local t0 = tick()
     while tick() - t0 < 5 and not sproutIn(field) do task.wait(0.2) end
     if sproutIn(field) then
@@ -3944,15 +4159,15 @@ function Farm.field()
     local bf, stack = Boost.field()
     if bf then return bf, string.format("field boost x%d em %s", stack, U.fname(bf)) end
     local sf = Sprout.farmField()
-    if sf and F.unlocked(sf) then return sf, "sprout em " .. 
-U.fname(sf) end
+    if sf and F.unlocked(sf) then return sf, "sprout em " .. U.fname(sf) end
     local qf = Quest.field()
     if qf then return qf, "quest pede " .. U.fname(qf) end
     return Cfg.Field, "farm normal em " .. U.fname(Cfg.Field)
 end
 -- loot = loot da sprout: ignora marks, bolhas e tokens de habilidade
 -- SPROUT COM MOB NO CAMPO: não entra em combate. Velocidade normal, farma/looteia
--- desviando do mob. Token de prioridade pode passar perto do mob; com menos de 50% de
+-- desviando do mob. Token de 
+prioridade pode passar perto do mob; com menos de 50% de
 -- vida evita 100% (nada perto do mob e foge se ele chegar perto).
 Farm.AVOID_R = 14
 function Farm.avoidCtx(mobs)
@@ -3977,13 +4192,13 @@ function Farm.avoidCtx(mobs)
             if mp then
                 local am = Vector3.new(mp.X - a.X, 0, mp.Z - a.Z)
                 local t = len2 > 0 and math.clamp(am:Dot(ab) / len2, 0, 1) or 0
-                d = math.min(d, (am - ab * t).Magnitude)
+                d = math.min(d, (am - ab * 
+t).Magnitude)
             end
         end
         return d
     end
-    -- ponto pode? (prio = token de 
-prioridade)
+    -- ponto pode? (prio = token de prioridade)
     function ctx.ok(p, prio)
         if prio and not ctx.low then return true end
         local hrp = U.hrp()
@@ -4006,10 +4221,10 @@ function Farm.safePoint(hb, ctx)
     local best, bs
     for i = -2, 2 do
         for j = -2, 2 do
-            local p = (hb.CFrame * CFrame.new(i * hb.Size.X / 5.5, 0, j * hb.Size.Z / 5.5)).Position
+            local p = (hb.CFrame * 
+CFrame.new(i * hb.Size.X / 5.5, 0, j * hb.Size.Z / 5.5)).Position
             p = Vector3.new(p.X, hrp and hrp.Position.Y or p.Y, p.Z)
-            local sc = math.min(ctx.dist(p), 
-Farm.AVOID_R * 2.5) - (hrp and U.fdist(p, hrp.Position) * 0.05 or 0)
+            local sc = math.min(ctx.dist(p), Farm.AVOID_R * 2.5) - (hrp and U.fdist(p, hrp.Position) * 0.05 or 0)
             if not bs or sc > bs then best, bs = p, sc end
         end
     end
@@ -4021,8 +4236,7 @@ function Farm.step(field, loot)
     if not hb then act("Campo não encontrado: " .. tostring(field)) task.wait(1) return end
     if not F.unlocked(field) then act(U.fname(field) .. " não está liberado (aba Campos)") task.wait(1) return end
     local hrp = U.hrp()
-    if not F.inside(hb, hrp.Position) 
-then
+    if not F.inside(hb, hrp.Position) then
         act("Indo para " .. U.fname(field))
         Move.tween(F.center(hb), nil, function() return Sched.check() end)
         return
@@ -4042,7 +4256,8 @@ then
             if sproutMode then
                 avoid = Farm.avoidCtx(mobs)
             else
-                local res = Fight.run(hb, "Mob no campo")
+                local res = Fight.run(hb, 
+"Mob no campo")
                 if res == "timeout" then Farm.mobSkip = tick() + 60 end   -- mob que não morre: ignora um tempo
                 return
             end
@@ -4053,13 +4268,13 @@ then
         if avoid.low and avoid.dist(hrp.Position) < Farm.AVOID_R then
             act("Sprout: fugindo do mob (vida < 50%)")
             local sp = Farm.safePoint(hb, avoid)
-            if sp then Move.walk(sp, { reach = 3, timeout = 2.5 }) end
+            if sp then Move.walk(sp, 
+{ reach = 3, timeout = 2.5 }) end
             return
         end
     end
     local function tryBubble()
-        if loot or not Cfg.AutoBubbles 
-then return false end
+        if loot or not Cfg.AutoBubbles then return false end
         local b
         if avoid then
             for _, e in ipairs(Bub.inField(hb)) do
@@ -4090,8 +4305,7 @@ then return false end
         if tryToken() or tryBubble() then return end
     end
     local target
-    if Cfg.StayInMarks and not loot then target = Mark.walkPoint(hb) 
-end
+    if Cfg.StayInMarks and not loot then target = Mark.walkPoint(hb) end
     target = target or Grid.next(field, hb)
     if avoid and target and not avoid.ok(target, false) then target = Farm.safePoint(hb, avoid) or target end
     act((loot and "Loot da sprout em " or "Farmando em ") .. U.fname(field))
@@ -4100,14 +4314,14 @@ end
             if avoid then
                 local hp = U.hrp()
                 if avoid.low and hp and avoid.dist(hp.Position) < Farm.AVOID_R then return true end   -- mob chegou: foge
-                if Cfg.AutoTokens and Tok.inField(hb, function(tk, p) 
-return avoid.ok(p, Farm.isPrio(tk)) end)[1] then return true end
+                if Cfg.AutoTokens and Tok.inField(hb, function(tk, p) return avoid.ok(p, Farm.isPrio(tk)) end)[1] then return true end
                 if not loot and Cfg.AutoBubbles then
                     for _, e in ipairs(Bub.inField(hb)) do if avoid.ok(e.pos, false) then return true end end
                 end
                 return false
             end
-            return (Cfg.AutoTokens and Tok.best(hb) ~= nil) or (not loot and Cfg.AutoBubbles and Bub.best(hb) ~= nil)
+            return (Cfg.AutoTokens and Tok.best(hb) ~= nil) or (not loot and Cfg.AutoBubbles and Bub.best(hb) 
+~= nil)
         end,
         onTick = function(p) Grid.touch(field, hb, p) end,
     })
@@ -4118,18 +4332,19 @@ end
 -- { name, label, all = interrompe tudo | over = {tarefas que ela interrompe},
 --   want = function() return "motivo" ou nil end, run = function() ... end }
 ------------------------------------------------------------------
--- ERROS: guarda o último, salva em BSU2_Errors.txt e pula a tarefa que errar 3x seguidas
+-- ERROS: guarda o último, salva em 
+BSU2_Errors.txt e pula a tarefa que errar 3x seguidas
 local Err = { last = "-", count = {}, skip = {} }
 function Err.log(where, msg)
-    local line = os.date("%d/%m 
-%H:%M:%S") .. " [" .. where .. "] " .. tostring(msg)
+    local line = os.date("%d/%m %H:%M:%S") .. " [" .. where .. "] " .. tostring(msg)
     Err.last = line
     Con.log("Error", "[" .. where .. "] " .. tostring(msg):match("^[^\n]*"))
     warn("[BSU] " .. line)
     pcall(function()
         if appendfile and isfile and isfile("BSU2_Errors.txt") then appendfile("BSU2_Errors.txt", line .. "\n")
         elseif writefile then
-            local old = (isfile and readfile and isfile("BSU2_Errors.txt")) and readfile("BSU2_Errors.txt") or ""
+            local old = (isfile and readfile and isfile("BSU2_Errors.txt")) and 
+readfile("BSU2_Errors.txt") or ""
             writefile("BSU2_Errors.txt", old .. line .. "\n")
         end
     end)
@@ -4162,17 +4377,18 @@ Tasks = {
     { name = "Bean", label = "Magic Bean", over = { Farm = true, Convert = true, SproutLoot = true },
       want = function() return Bean.want() end,
       run = function() Bean.plant() end },
-    { name = "SproutLoot", label = "Loot da sprout", over = { Farm = true, Convert = true },
+    { name = "SproutLoot", label = 
+"Loot da sprout", over = { Farm = true, Convert = true },
       want = function()
           Sprout.update()
-          if Sprout.looting() and F.unlocked(Sprout.lootField) 
-then return "loot em " .. U.fname(Sprout.lootField) end
+          if Sprout.looting() and F.unlocked(Sprout.lootField) then return "loot em " .. U.fname(Sprout.lootField) end
       end,
       run = function() Farm.step(Sprout.lootField, true) end },
     { name = "Quest", label = "Quests", over = { Farm = true },
       want = function() return Quest.want() end,
       run = function() Quest.run() end },
-    { name = "Booster", label = "Field Booster", over = { Farm = true, QuestMob = true, Kill = true },
+    { name = "Booster", label = "Field Booster", over = { Farm = true, 
+QuestMob = true, Kill = true },
       want = function()
           if Sprout.looting() or not U.bagEmpty() then return nil end   -- vai depois de converter
           local n = Boost.ready()
@@ -4182,7 +4398,8 @@ then return "loot em " .. U.fname(Sprout.lootField) end
     { name = "Renew", label = "Renovar boost", over = { Farm = true, QuestMob = true, Kill = true, Convert = true },
       want = function()
           local f, d, glitter = Boost.renewTarget()
-          return f and string.format("boost de %s acabando (%ds): %s", U.fname(f), math.floor(d.left), glitter and "Glitter" or "Field Dice")
+          return f and string.format("boost de %s 
+acabando (%ds): %s", U.fname(f), math.floor(d.left), glitter and "Glitter" or "Field Dice")
       end,
       run = function() Boost.renew() end },
     { name = "QuestMob", label = "Mob de quest", over = { Farm = true },
@@ -4201,7 +4418,8 @@ then return "loot em " .. U.fname(Sprout.lootField) end
       want = function()
           if not Cfg.AutoKill or Sprout.looting() then return nil end
           if Boost.field() then return nil end   -- field boost da sua lista ativo: farma lá primeiro
-          if Cfg.KillOnlyAfterConvert and not U.bagEmpty() then return nil end
+          if Cfg.KillOnlyAfterConvert and not U.bagEmpty() then return 
+nil end
           local e = anyMob(function(x) return Cfg.KillMobs[x.mob] == true end)
           return e and ("matar " .. e.mob .. " em " .. U.fname(e.field))
       end,
@@ -4211,7 +4429,8 @@ then return "loot em " .. U.fname(Sprout.lootField) end
       end },
     { name = "Convert", label = "Convertendo", over = { Farm = true },
       want = function()
-          if not Cfg.AutoConvert or Sprout.looting() then return nil end
+          if not Cfg.AutoConvert or 
+Sprout.looting() then return nil end
           local pct = U.bagPct() * 100
           if pct >= Cfg.ConvertPercent then return string.format("bolsa em %d%%", math.floor(pct)) end
       end,
@@ -4239,7 +4458,8 @@ task.spawn(function()
     while running() do
         local ok, err = pcall(function()
             if not U.alive() then
-                St.task, St.reason = "Esperando", "personagem morto/carregando"
+                St.task, St.reason = 
+"Esperando", "personagem morto/carregando"
                 Move.cancel()
                 task.wait(1)
                 return
@@ -4268,7 +4488,8 @@ task.spawn(function()
                 Con.log("Info", "Doing " .. pick.label .. ": " .. tostring(why))
                 Sched.lastPick, Sched.lastWhy = pick, why
             end
-            St.task, St.reason = pick.label, why
+            St.task, St.reason = pick.label, 
+why
             local okR, e = xpcall(pick.run, function(m) return tostring(m) .. "\n" .. debug.traceback() end)
             if okR then
                 Err.count[pick.name] = 0
@@ -4293,14 +4514,15 @@ task.spawn(function()
 end)
 
 ------------------------------------------------------------------
--- ABA HIVE: ovos, Royal Jelly e level das abelhas
+-- ABA HIVE: ovos, Royal Jelly e 
+level das abelhas
 --  * slot = "coluna,linha" (coluna 1-5 da esquerda, linha de baixo pra cima) = Cells."C3,6"
---  * chocar/RJ:  Events.UseItem:FireServer("Basic 
-Egg" | "Royal Jelly", { "3,6" })
+--  * chocar/RJ:  Events.UseItem:FireServer("Basic Egg" | "Royal Jelly", { "3,6" })
 --    resposta:   GetRolled { abelha, item, desc, raridade, abelha antiga, slot, gifted }
 --  * comprar:    Events.BuyItem:FireServer("Basic Egg", n)
 --  * alimentar:  Events.FeedEvent:FireServer("3,6", "Treat") -> FeedEvent(quantos faltam pro level, quantos tem, ama?)
---                Events.UseItem:FireServer("Treat", { "3,6", n })
+--                Events.UseItem:FireServer("Treat", 
+{ "3,6", n })
 ------------------------------------------------------------------
 local Bees = { status = "-", rjStatus = "-", lvlStatus = "-", picking = false, rolled = nil, feedAns = nil }
 Bees.RARITIES = { "Common", "Rare", "Epic", "Legendary", "Mythic", "Exclusive", "Event" }
@@ -4311,8 +4533,7 @@ Bees.rarity = {}
 for r, list in pairs({
     Common = { "Basic Bee" },
     Rare = { "Joyful Bee", "Curious Bee", "Hasty Bee", "Brave Bee", "Observer Bee", "Willful Bee" },
-    Epic = { "Honey Bee", "Explosive Bee", "Pop Bee", "Molten Bee", "Scared Bee", "Furious Bee", "Ice 
-Bee", "Blow Bee", "Rough Bee" },
+    Epic = { "Honey Bee", "Explosive Bee", "Pop Bee", "Molten Bee", "Scared Bee", "Furious Bee", "Ice Bee", "Blow Bee", "Rough Bee" },
     Legendary = { "Calm Bee", "Blushy Bee", "Aquamarine Bee", "Shadow Bee", "Inspired Bee", "Devil Bee" },
     Mythic = { "Abyssal Bee", "Fractal Bee", "Plasma Bee" },
     Exclusive = { "Giroy Bee" }, Event = { "Laser Bee" },
@@ -4321,8 +4542,7 @@ function Bees.rarityOf(name) return name and Bees.rarity[U.key(name)] or nil end
 -- raridade desconhecida: pergunta pro jogo (GetBeeStats(abelha) -> { nome, level, raridade, ... })
 local StatsR = remote("GetBeeStats")
 Bees.statsAns = nil
-if StatsR then conn(StatsR.OnClient
-Event:Connect(function(t)
+if StatsR then conn(StatsR.OnClientEvent:Connect(function(t)
     if type(t) == "table" and t[1] and type(t[3]) == "string" then
         Bees.rarity[U.key(t[1])] = t[3]
         Bees.statsAns = { name = t[1], rarity = t[3], level = tonumber(t[2]), bond = tonumber(t[4]), max = tonumber(t[5]), t = tick() }
@@ -4342,10 +4562,10 @@ function Bees.askRarity(info)
 end
 -- lista inicial (completa sozinha com o UpdateCollection do jogo)
 Bees.TYPES = { "Basic Bee", "Joyful Bee", "Curious Bee", "Hasty Bee", "Honey Bee", "Calm Bee", "Giroy Bee", "Blushy Bee",
-    "Brave Bee", "Explosive Bee", "Aquamarine Bee", "Pop Bee", "Molten Bee", "Scared Bee", "Observer Bee", "Shadow Bee",
+    "Brave Bee", "Explosive Bee", "Aquamarine Bee", "Pop Bee", "Molten Bee", "Scared Bee", 
+"Observer Bee", "Shadow Bee",
     "Inspired Bee", "Devil Bee", "Furious Bee", "Ice Bee", "Blow Bee", "Rough Bee", "Abyssal Bee", "Fractal Bee",
-    "Plasma Bee", "Laser Bee", 
-"Willful Bee", "Sleepy Bee", "Matter Bee", "Leader Bee", "Sticker Bee" }
+    "Plasma Bee", "Laser Bee", "Willful Bee", "Sleepy Bee", "Matter Bee", "Leader Bee", "Sticker Bee" }
 local function prettyBee(n) return (tostring(n):gsub("(%l)(%u)", "%1 %2")) end   -- "CalmBee" -> "Calm Bee"
 function Bees.addType(n)
     n = prettyBee(n)
@@ -4363,11 +4583,11 @@ do
         Bees.rolled = { bee = tostring(t[1] or ""), item = t[2], rarity = tostring(t[4] or ""), slot = tostring(t[6] or ""),
             gifted = t[7] == true, t = tick() }
         Bees.addType(Bees.rolled.bee)
-        if Bees.rolled.rarity ~= "" then Bees.rarity[U.key(Bees.rolled.bee)] = Bees.rolled.rarity end
+        if Bees.rolled.rarity ~= "" then 
+Bees.rarity[U.key(Bees.rolled.bee)] = Bees.rolled.rarity end
     end)) end
     local c = remote("UpdateCollection")
-    if c then conn(c.OnClientEvent:Co
-nnect(function(t)
+    if c then conn(c.OnClientEvent:Connect(function(t)
         if type(t) ~= "table" then return end
         for _, e in pairs(t) do
             if type(e) == "table" and e[1] then
@@ -4376,7 +4596,8 @@ nnect(function(t)
             end
         end
     end)) end
-    if FeedR then conn(FeedR.OnClientEvent:Connect(function(need, have, loves)
+    if FeedR then conn(FeedR.OnCl
+ientEvent:Connect(function(need, have, loves)
         Bees.feedAns = { need = tonumber(need) or 0, have = tonumber(have) or 0, loves = loves == true, t = tick() }
     end)) end
 end
@@ -4413,10 +4634,10 @@ function Bees.list()
     end
     table.sort(out, function(a, b)
         local ax, ay = a.slot:match("(%d+),(%d+)")
-        local bx, by = b.slot:match("(%d+),(%d+)")
+        local bx, by = 
+b.slot:match("(%d+),(%d+)")
         ax, ay, bx, by = tonumber(ax) or 0, tonumber(ay) or 0, tonumber(bx) or 0, tonumber(by) or 0
-        if ax ~= bx then return ax < bx 
-end
+        if ax ~= bx then return ax < bx end
         return ay > by
     end)
     return out
@@ -4438,12 +4659,12 @@ conn(UIS.InputBegan:Connect(function(inp, gp)
     if not Bees.picking or inp.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
     local cam = workspace.CurrentCamera
     local m = UIS:GetMouseLocation()
-    local ray = cam:ViewportPointToRay(m.X, m.Y)
+    local ray = 
+cam:ViewportPointToRay(m.X, m.Y)
     local cs = Bees.cells()
     if not cs then return end
     local params = RaycastParams.new()
-    params.FilterType = 
-Enum.RaycastFilterType.Include
+    params.FilterType = Enum.RaycastFilterType.Include
     params.FilterDescendantsInstances = { cs }
     local hit = workspace:Raycast(ray.Origin, ray.Direction * 500, params)
     local cur = hit and hit.Instance
@@ -4455,8 +4676,7 @@ Enum.RaycastFilterType.Include
     end
 end))
 
--- espera o GetRolled desse slot 
-(depois de chocar/RJ)
+-- espera o GetRolled desse slot (depois de chocar/RJ)
 local function waitRoll(slot, since)
     local t0 = tick()
     while tick() - t0 < 4 and running() do
@@ -4466,10 +4686,40 @@ local function waitRoll(slot, since)
     end
     return nil
 end
+-- item com nome EXATO no inventário (sem o "parecido" do 
+Inv.find: um nome errado no UseItem dá kick)
+local function invExact(name)
+    local f = PD:FindFirstChild("Inventory")
+    if not f then return nil end
+    local k = U.key(name)
+    for _, c in ipairs(f:GetChildren()) do
+        if c:IsA("ValueBase") and (U.key(c.Name) == k or U.key(c:GetAttribute("Name") or "") == k) then return c end
+    end
+    return nil
+end
+local function invHave(name) local c = invExact(name) return c and tonumber(c.Value) or 0 end
 local function useOn(item, slot, n)
     if not UseItemR then return false end
+    -- só dispara se o item existe de verdade e tem quantidade
+    if invHave(item) < (n or 1) then Con.log("Info", "Hive: sem " .. item .. " no inventário, não usei") return false end
+    local si = Bees.slot(slot)
+    if not (si and si.owned) then Con.log("Info", "Hive: slot " .. tostring(slot) .. " não existe/não comprado, não usei") return false end
+    -- espera o inventário sincronizar entre um uso e outro (usar um egg que o servidor já gastou = kick)
+    Bees.useT = Bees.useT or {}
+    local gap = tick() - (Bees.useT[item] or 0)
+    if gap < 1.2 then task.wait(1.2 - gap) end
+    local before = invHave(item)
+    if before < (n or 1) then return false end
     local args = n and { slot, n } or { slot }
-    return pcall(function() UseItemR:FireServer(item, args) end)
+    local ok = pcall(function() UseItemR:FireServer(item, args) end)
+    Bees.useT[item] = tick()
+    local t0 = tick()
+    while tick() - t0 < 4 and invHave(item) >= before do task.wait(0.05) end
+    if invHave(item) >= before then
+        Con.log("Info", "Hive: usei " .. item .. " no " .. tostring(slot) .. " mas o inventário não mudou (" .. before .. ")")
+        task.wait(2)
+    end
+    return ok
 end
 
 -- AUTO GIFTED BASIC BEE: choca Basic Egg no slot até vir uma Basic Bee gifted
@@ -4477,20 +4727,43 @@ function Bees.giftedStep()
     local slot = Cfg.HiveSlot
     local info = slot ~= "" and Bees.slot(slot)
     if not info then Bees.status = "Escolha o slot (Select Position)" return end
+    if not info.owned then Bees.status = "Slot " .. slot .. " não comprado: desliguei" setCfg("AutoGiftedBasic", false) return end
     if info.gifted and U.key(info.name or "") == "basicbee" then
         Bees.status = "Pronto: Basic Bee gifted no " .. slot
         setCfg("AutoGiftedBasic", false)
         return
     end
-    if Inv.count("Basic Egg") <= 0 then
-        if Cfg.BuyBasicEggs and BuyR then
-            pcall(function() BuyR:FireServer("Basic Egg", math.max(1, math.floor(Cfg.EggBuyAmount))) end)
-            Bees.status = "Comprando " .. Cfg.EggBuyAmount .. " Basic Egg"
+    -- contador próprio: o número do inventário pode ficar atrasado/travado, então conta cada choco confirmado
+    if tick() - (Bees.eggSeen or 0) > 30 then Bees.eggLeft = nil end
+    Bees.eggSeen = tick()
+    local eggs = invHave("Basic Egg")
+    if Bees.eggLeft then eggs = math.min(eggs, Bees.eggLeft) else Bees.eggLeft = eggs end
+    if eggs <= 0 then
+        if Cfg.BuyBasicEggs and BuyR 
+then
+            local before = invHave("Basic Egg")
+            local amt = math.max(1, math.floor(Cfg.EggBuyAmount))
+            -- guarda o que o jogo responder (pra saber por que não comprou)
+            local note
+            local nr = remote("NotificationSent")
+            local nc = nr and nr.OnClientEvent:Connect(function(...)
+                for _, v in ipairs({ ... }) do if type(v) == "string" and v ~= "" then note = v end end
+            end)
+            pcall(function() BuyR:FireServer("Basic Egg", amt) end)
+            Bees.status = "Comprando " .. amt .. " Basic Egg"
+            Con.log("Info", "Hive: BuyItem(\"Basic Egg\", " .. amt .. ")")
             local t0 = tick()
-            while tick() - t0 < 2.5 and Inv.count("Basic Egg") <= 0 do task.wait(0.1) end
-            if Inv.count("Basic Egg") <= 0 then
-                Bees.status = "Não consegui comprar Basic Egg (sem honey?): desliguei"
-                setCfg("AutoGiftedBasic", false)
+            while tick() - t0 < 5 and invHave("Basic Egg") <= before do task.wait(0.1) end
+            if nc then nc:Disconnect() end
+            if invHave("Basic Egg") <= before then
+                Bees.status = "Não consegui comprar Basic Egg: desliguei" .. (note and (" (jogo: " .. note .. ")") or "")
+                Con.log("Info", "Hive: compra falhou" .. (note and (": " .. note) or " (sem resposta do jogo)"))
+                setCfg("AutoGiftedBasic", 
+false)
+            else
+                Bees.eggLeft = invHave("Basic Egg") - before
+                Con.log("Info", "Hive: comprou " .. Bees.eggLeft .. " Basic Egg")
+                task.wait(1)   -- deixa o servidor terminar a compra antes de chocar
             end
         else
             Bees.status = "Acabou o Basic Egg: desliguei"
@@ -4499,26 +4772,30 @@ function Bees.giftedStep()
         return
     end
     local t = tick()
-    useOn("Basic Egg", slot)
+    if not useOn("Basic Egg", slot) then Bees.status = "Não achei o Basic Egg certo no inventário: desliguei" setCfg("AutoGiftedBasic", false) return end
     local r = waitRoll(slot, t)
     if r then
-        Bees.status = string.format("Chocou %s%s no %s", r.bee, r.gifted and " (GIFTED)" or "", slot)
+        Bees.eggLeft = math.max(0, (Bees.eggLeft or 1) - 1)
+        Bees.status = string.format("Chocou %s%s no %s | eggs: %d", r.bee, r.gifted and " (GIFTED)" or "", slot, Bees.eggLeft)
         if r.gifted and U.key(r.bee) == "basicbee" then
-            setCfg("AutoGiftedBasic", 
-false)
+            setCfg("AutoGiftedBasic", false)
             Bees.status = "Pronto: Basic Bee gifted no " .. slot
-            if Hook and Hook.post and Cfg.WebhookOn then Hook.post({ content = "🐝 Basic Bee **gifted** no slot " .. slot }) end
+            if Hook and Hook.post 
+and Cfg.WebhookOn then Hook.post({ content = "🐝 Basic Bee **gifted** no slot " .. slot }) end
         end
     else
-        Bees.status = "Sem resposta do jogo, tentando de novo"
+        -- sem resposta = não chocou (acabou o egg?): NUNCA tenta de novo, desliga
+        Bees.eggLeft = 0
+        Bees.status = "O jogo não respondeu ao egg (acabou?): desliguei"
+        Con.log("Info", "Hive: egg sem resposta, desliguei o Auto Gifted Basic")
+        setCfg("AutoGiftedBasic", false)
     end
     task.wait(0.4)
 end
 
 -- AUTO ROYAL JELLY: usa RJ no slot até vir o tipo/raridade/gifted escolhido
 function Bees.rjWanted(r)
-    if Cfg.RJStopGifted and r.gifted 
-then return true end
+    if Cfg.RJStopGifted and r.gifted then return true end
     if Cfg.RJBeeTypes[prettyBee(r.bee)] or Cfg.RJBeeTypes[r.bee] then return true end
     for k, on in pairs(Cfg.RJBeeTypes) do if on and U.key(k) == U.key(r.bee) then return true end end
     if Cfg.RJStopRarity[r.rarity] then return true end
@@ -4529,8 +4806,7 @@ function Bees.rjTypes()
     local t = {}
     for _, n in ipairs(Bees.TYPES) do
         local r = Bees.rarityOf(n)
-        if not r or 
-table.find(Bees.RJ_RARITIES, r) then table.insert(t, n) end
+        if not r or table.find(Bees.RJ_RARITIES, r) then table.insert(t, n) end
     end
     return t
 end
@@ -4540,9 +4816,9 @@ end
 function Bees.rjStep()
     local slot = Cfg.HiveSlot
     local info = slot ~= "" and Bees.slot(slot)
-    if not info or not info.bee then Bees.rjStatus = "Escolha um slot com abelha (Select Position)" return end
-    if not Bees.rjHasTarget() then Bees.rjStatus = "Escolha Bee Types, 
-raridade ou Stop On Any Gifted" setCfg("AutoRJ", false) return end
+    if not info or not info.bee then 
+Bees.rjStatus = "Escolha um slot com abelha (Select Position)" return end
+    if not Bees.rjHasTarget() then Bees.rjStatus = "Escolha Bee Types, raridade ou Stop On Any Gifted" setCfg("AutoRJ", false) return end
     -- abelha atual: Exclusive/Event nunca recebe RJ; se já é o que procura, não gasta
     local curR = Bees.askRarity(info)
     if curR and Bees.NO_RJ[curR] then
@@ -4551,17 +4827,16 @@ raridade ou Stop On Any Gifted" setCfg("AutoRJ", false) return end
         return
     end
     if Bees.rjWanted({ bee = info.name or "", rarity = curR or "", gifted = info.gifted }) then
-        Bees.rjStatus = string.format("%s (%s)%s já é o 
-que você procura: não usei RJ", info.name, curR or "?", info.gifted and " GIFTED" or "")
+        Bees.rjStatus = string.format("%s (%s)%s já é o que você procura: não usei RJ", info.name, curR or "?", info.gifted and " GIFTED" or "")
         setCfg("AutoRJ", false)
         return
     end
-    if Inv.count("Royal Jelly") <= 0 then Bees.rjStatus = "Acabou o Royal Jelly" setCfg("AutoRJ", false) return end
+    if invHave("Royal Jelly") <= 0 then Bees.rjStatus = "Acabou o Royal Jelly" setCfg("AutoRJ", false) return end
     local t = tick()
-    useOn("Royal Jelly", slot)
+    if not useOn("Royal Jelly", slot) then Bees.rjStatus = "Não achei o Royal Jelly no inventário: desliguei" setCfg("AutoRJ", false) return end
     local r = waitRoll(slot, t)
     if r then
-        Bees.rjStatus = string.format("%s → %s (%s)%s | RJ: %d", slot, r.bee, r.rarity, r.gifted and " GIFTED" or "", Inv.count("Royal Jelly"))
+        Bees.rjStatus = string.format("%s → %s (%s)%s | RJ: %d", slot, r.bee, r.rarity, r.gifted and " GIFTED" or "", invHave("Royal Jelly"))
         if Bees.rjWanted(r) then
             setCfg("AutoRJ", false)
             Bees.rjStatus = "Parou: " .. r.bee .. " (" .. r.rarity .. ")" .. (r.gifted and " GIFTED" or "") .. " no " .. slot
@@ -4570,7 +4845,9 @@ que você procura: não usei RJ", info.name, curR or "?", info.gifted and " GIFT
             end
         end
     else
-        Bees.rjStatus = "Sem resposta do jogo, tentando de novo"
+        Bees.rjStatus = "O jogo não respondeu ao Royal Jelly (acabou?): desliguei"
+        Con.log("Info", "Hive: RJ sem resposta, desliguei o Auto RJ")
+        setCfg("AutoRJ", false)
     end
     task.wait(0.4)
 end
@@ -4578,7 +4855,8 @@ end
 -- AUTO LEVEL UP HIVE: dá Treat pras abelhas abaixo do Target Level (menor level primeiro)
 function Bees.below()
     local t = {}
-    for _, i in ipairs(Bees.list()) do if i.level > 0 and i.level < Cfg.TargetLevel then table.insert(t, i) end end
+    for _, i in ipairs(Bees.list()) do if i.level > 0 and i.level < Cfg.TargetLevel then table.insert(t, 
+i) end end
     table.sort(t, function(a, b) return a.level < b.level end)
     return t
 end
@@ -4600,16 +4878,16 @@ function Bees.levelStep()
         setCfg("AutoLevelHive", false)
         return
     end
-    local treats = Inv.count("Treat")
+    local treats = invHave("Treat")
     if treats <= 0 then
-        Bees.lvlStatus = string.format("Acabou o Treat 
-(faltam %d abelha(s) pro level %d)", #list, Cfg.TargetLevel)
+        Bees.lvlStatus = string.format("Acabou o Treat (faltam %d abelha(s) pro level %d)", #list, Cfg.TargetLevel)
         setCfg("AutoLevelHive", false)
         return
     end
     local b = list[1]
     local a = askFeed(b.slot)
-    if not a then Bees.lvlStatus = "Sem resposta do FeedEvent" task.wait(2) return end
+    if not a then Bees.lvlStatus = "Sem 
+resposta do FeedEvent" task.wait(2) return end
     local n = math.min(a.need, treats)
     if n <= 0 then task.wait(1) return end
     useOn("Treat", b.slot, n)
@@ -4618,7 +4896,8 @@ function Bees.levelStep()
     task.wait(1.2)
 end
 -- quantos Treats faltam: o bond é ACUMULADO (Lvl 6 = 4000/15000 -> o 15000 é o total pra chegar no Lvl 7).
--- GetBeeStats(abelha) -> { nome, level, raridade, bond, bond do próximo level, ... }.
+-- GetBeeStats(abelha) -> { nome, level, raridade, bond, bond do 
+próximo level, ... }.
 -- Guarda o total de cada level (aprende com as abelhas e salva) e calcula até o Target Level. Treat = 10 de bond.
 Bees.bondLvl = readJSON("BSU2_BondLevels.json") or {}   -- ["6"] = 15000 (bond total pra sair do 6 pro 7)
 Bees.calc = { busy = false, total = nil, unknown = 0, t = 0, target = nil }
@@ -4636,8 +4915,7 @@ end
 if StatsR then conn(StatsR.OnClientEvent:Connect(function(t)
     if type(t) == "table" then
         local lv, mx = tonumber(t[2]), tonumber(t[5])
-        if lv and mx and mx > 0 and 
-Bees.bondLvl[tostring(lv)] ~= mx then
+        if lv and mx and mx > 0 and Bees.bondLvl[tostring(lv)] ~= mx then
             Bees.bondLvl[tostring(lv)] = mx
             writeJSON("BSU2_BondLevels.json", Bees.bondLvl)
         end
@@ -4662,8 +4940,7 @@ function Bees.calcTreats()
                 if need then total += math.max(0, math.ceil((need - st.bond) / 10))
                 else
                     unknown += 1
-                    total += math.max(0, math.ceil(((st.max or st.bond) - st.bond) / 10))   -- pelo menos o 
-próximo level
+                    total += math.max(0, math.ceil(((st.max or st.bond) - st.bond) / 10))   -- pelo menos o próximo level
                 end
             end
         end
@@ -4673,15 +4950,15 @@ próximo level
 end
 function Bees.levelInfo()
     local list = Bees.below()
-    local txt = string.format("Abaixo do level %d: %d abelha(s) | Treat: %d", Cfg.TargetLevel, #list, Inv.count("Treat"))
+    local txt = string.format("Abaixo do level %d: %d abelha(s) | Treat: %d", Cfg.TargetLevel, #list, invHave("Treat"))
     local c = Bees.calc
     if c.busy then
-        txt ..= "\nCalculando Treats 
-necessários..."
+        txt ..= "\nCalculando Treats necessários..."
     elseif c.total and c.target == Cfg.TargetLevel then
-        local have = Inv.count("Treat")
+        local have = invHave("Treat")
         txt ..= string.format("\nTreats necessários: %d%s %s", c.total, c.unknown > 0 and "+" or "",
-            have >= c.total and "(dá)" or string.format("(faltam %d)", c.total - have))
+            have >= c.total and "(dá)" or 
+string.format("(faltam %d)", c.total - have))
         if c.unknown > 0 then
             txt ..= string.format("\n%d abelha(s): ainda não sei o bond do level %d (aprende quando alguma abelha chegar no level %d)",
                 c.unknown, Cfg.TargetLevel - 1, Cfg.TargetLevel - 1)
@@ -4692,7 +4969,8 @@ necessários..."
     return txt
 end
 
--- FEED UNTIL GIFTED: descobre a comida que a abelha ama (FeedEvent responde "ama?"),
+-- FEED UNTIL GIFTED: descobre a comida que a abelha ama 
+(FeedEvent responde "ama?"),
 -- guarda por tipo de abelha e dá N dessa comida repetidamente até virar gifted / limite / acabar.
 Bees.FOODS = { "Blueberry", "Strawberry", "Pineapple", "Sunflower Seed" }   -- completa com o UpdateInventory
 Bees.fav = {}    -- [tipo de abelha] = comida favorita (só enquanto o Feed Until Gifted está ligado: testa toda vez)
@@ -4700,19 +4978,20 @@ Bees.feedStatus, Bees.fed, Bees.giftNote = "-", 0, 0
 function Bees.addFood(n)
     n = tostring(n)
     if n == "" or U.key(n) == "treat" then return end
-    for _, f in ipairs(Bees.FOODS) do if U.key(f) == U.key(n) then return end end
+    for _, f in ipairs(Bees.FOODS) do if U.key(f) == U.key(n) then return 
+end end
     table.insert(Bees.FOODS, n)
 end
 do
     local inv = remote("UpdateInventory")
     if inv then conn(inv.OnClientEvent:Connect(function(txt)
         if type(txt) ~= "string" then return end
-        local name, desc = txt:match("^%d+|([^\255]+)
-\255([^\255]*)")
+        local name, desc = txt:match("^%d+|([^\255]+)\255([^\255]*)")
         if name and desc and desc:lower():find("bond", 1, true) then Bees.addFood(name) end
     end)) end
     local nt = remote("NotificationSent")
-    if nt then conn(nt.OnClientEvent:Connect(function(_, txt)
+    if nt then conn(nt.OnClie
+ntEvent:Connect(function(_, txt)
         if type(txt) == "string" and txt:lower():find("gifted", 1, true) then Bees.giftNote = tick() end
     end)) end
 end
@@ -4733,8 +5012,7 @@ function Bees.findFav(info)
     if Bees.fav[key] then return Bees.fav[key] end
     for _, food in ipairs(Bees.FOODS) do
         Bees.feedStatus = "Testando " .. food .. " na " .. key
-        local a = askFood(info.slot, 
-food)
+        local a = askFood(info.slot, food)
         if a and a.loves then
             Bees.fav[key] = food
             return food
@@ -4753,10 +5031,9 @@ function Bees.feedStep()
     if not food then return stop((info.name or "A abelha") .. " não gosta de nada") end
     local limit = math.max(1, math.floor(Cfg.FeedLimit))
     if Bees.fed >= limit then return stop(string.format("Limite atingido: %d %s sem gifted", Bees.fed, food)) end
-    local have = Inv.count(food)
+    local have = invHave(food)
     if have <= 0 then return stop("Acabou " .. food .. " (" .. Bees.fed .. " dados)") end
-    local n = math.min(math.max(1, math.floor(Cfg.FeedAmount)), limit 
-- Bees.fed, have)
+    local n = math.min(math.max(1, math.floor(Cfg.FeedAmount)), limit - Bees.fed, have)
     local t = tick()
     useOn(food, slot, n)
     Bees.fed += n
@@ -4779,12 +5056,12 @@ end
 function Bees.favText()
     local info = Cfg.HiveSlot ~= "" and Bees.slot(Cfg.HiveSlot)
     if not info or not info.name then return "Favorita: -" end
-    return "Favorita da " .. info.name .. ": " .. 
-(Bees.fav[info.name] or "testa ao ligar")
+    return "Favorita da " .. info.name .. ": " .. (Bees.fav[info.name] or "testa ao ligar")
 end
 onCfg("FeedGifted", function(v) if v then Bees.fed = 0 Bees.fav = {} end end)
 
--- FEED BEES FOR QUESTS: objetivos "Feed 500 Treat to your Bees. 0/500" das quests que o script faz.
+-- FEED BEES FOR QUESTS: 
+objetivos "Feed 500 Treat to your Bees. 0/500" das quests que o script faz.
 -- Dá o item que falta pra abelha de menor level (sem ir pra colmeia, junto com o farm).
 -- "Raise N Bees to Level X" é ignorado (fica manual).
 Bees.questStatus = "-"
@@ -4838,8 +5115,7 @@ function Bees.pickFor(item, bees)
         if not seen[k] then
             seen[k] = true
             Bees.loves[k] = Bees.loves[k] or {}
-            if Bees.loves[k][item] == nil 
-then
+            if Bees.loves[k][item] == nil then
                 local a = askFood(b.slot, item)
                 Bees.loves[k][item] = a ~= nil and a.loves == true
                 task.wait(0.1)
@@ -4852,25 +5128,50 @@ end
 function Bees.questFeedStep()
     local list = Bees.questFeeds()
     if #list == 0 then Bees.questStatus = "Nenhuma quest de alimentar" return false end
-    if #Bees.list() == 0 then 
-Bees.questStatus = "Colmeia não encontrada" return false end
+    if #Bees.list() == 0 then Bees.questStatus = "Colmeia não encontrada" return false end
     local missing = {}
     for _, e in ipairs(list) do
         local item = invItem(e.item)
-        local have = item and Inv.count(item) or 0
-        if have > 0 then
+        local have = item and invHave(item) or 0
+        if item and U.key(item) == 
+"treat" then
+            -- Treat: só faz quando dá pra completar tudo de uma vez (nada de 1 em 1 conforme ganha treat)
+            if have >= e.left then
+                local left, given = e.left, 0
+                while left > 0 and running() and Cfg.FeedForQuests do
+                    local bee = Bees.pickFor(item, Bees.list())
+                    if not bee then break end
+                    local ans = askFood(bee.slot, item)
+                    local n = left
+                    if ans and ans.need > 0 then n = math.min(n, ans.need) end
+                    n = math.min(n, 
+invHave(item))
+                    if n <= 0 or not useOn(item, bee.slot, n) then break end
+                    left -= n
+                    given += n
+                    Bees.questStatus = string.format("%s: dando %d Treat de uma vez | faltam %d", e.quest, e.left, left)
+                end
+                Bees.questStatus = string.format("%s: dei %d Treat%s", e.quest, given, left > 0 and (" (faltaram " .. left .. ")") or " (completo)")
+                Quest.cacheT = 0
+                return true
+            end
+            table.insert(missing, 
+string.format("Treat (tem %d, precisa %d de uma vez)", have, e.left))
+        elseif have > 0 then
             local bee, loved = Bees.pickFor(item, Bees.list())
             if not bee then Bees.questStatus = "Nenhuma abelha pode receber " .. item return false end
             local ans = askFood(bee.slot, item)
             local n = math.min(e.left, have)
             if ans and ans.need > 0 then n = math.min(n, ans.need) end
             useOn(item, bee.slot, n)
-            Bees.questStatus = string.format("%s: dei %d %s pra %s (%s)%s | faltam %d", e.quest, n, item, bee.name or "?", bee.slot,
+            Bees.questStatus = string.format("%s: dei %d %s pra %s (%s)%s | faltam %d", e.quest, n, 
+item, bee.name or "?", bee.slot,
                 loved and " ♥" or "", e.left - n)
             Quest.cacheT = 0
             return true
+        else
+            table.insert(missing, e.item)
         end
-        table.insert(missing, e.item)
     end
     Bees.questStatus = "Sem item pra quest: " .. table.concat(missing, ", ")
     return false
@@ -4878,9 +5179,9 @@ end
 task.spawn(function()
     while running() do
         task.wait(2)
-        if Cfg.FeedForQuests and 
-Hive.mine() and not Bees.anyOn() and U.alive() then
-            local ok, e = pcall(Bees.questFeedStep)
+        if Cfg.FeedForQuests and Hive.mine() and not Bees.anyOn() and U.alive() then
+            local ok, e = 
+pcall(Bees.questFeedStep)
             if not ok then Err.log("FeedQuest", e) end
         end
     end
@@ -4889,8 +5190,7 @@ end)
 -- Qualquer função da aba Hive ligada: liga o Stop Everything (pausa o farm), vai até a colmeia
 -- e fica lá. Desligou tudo: desliga o Stop Everything (se foi a aba Hive que ligou).
 Bees.autoStop = false
-function Bees.anyOn() return Cfg.AutoGiftedBasic or Cfg.AutoRJ or Cfg.FeedGifted or 
-Cfg.AutoLevelHive end
+function Bees.anyOn() return Cfg.AutoGiftedBasic or Cfg.AutoRJ or Cfg.FeedGifted or Cfg.AutoLevelHive end
 function Bees.goHive()
     local h = Hive.mine()
     if not h then pcall(Hive.claim) h = Hive.mine() end
@@ -4917,8 +5217,7 @@ task.spawn(function()
                 return
             end
             Bees.wasOn = true
-            if not Cfg.StopEverything 
-then
+            if not Cfg.StopEverything then
                 setCfg("StopEverything", true)
                 Sched.abort = true
                 Move.cancel()
@@ -4943,9 +5242,9 @@ end)
 ------------------------------------------------------------------
 ;(function()
 local T = {
-    Bg = Color3.fromRGB(22, 22, 24), Side = Color3.fromRGB(28, 28, 31), 
-Sec = Color3.fromRGB(32, 32, 35),
-    Head = Color3.fromRGB(40, 40, 44), Item = Color3.fromRGB(46, 46, 51), Box = Color3.fromRGB(36, 50, 80),
+    Bg = Color3.fromRGB(22, 22, 24), Side = Color3.fromRGB(28, 28, 31), Sec = Color3.fromRGB(32, 32, 35),
+    Head = Color3.fromRGB(40, 40, 44), Item = Color3.fromRGB(46, 46, 
+51), Box = Color3.fromRGB(36, 50, 80),
     Accent = Color3.fromRGB(52, 96, 170), Top = Color3.fromRGB(42, 74, 128), Stroke = Color3.fromRGB(58, 58, 64),
     Text = Color3.fromRGB(232, 232, 236), Sub = Color3.fromRGB(150, 150, 160),
     Red = Color3.fromRGB(190, 65, 65), Green = Color3.fromRGB(80, 180, 105),
@@ -4961,8 +5260,8 @@ end
 local function corner(r) return new("UICorner", { CornerRadius = UDim.new(0, r or 6) }) end
 local function vlist(p) return new("UIListLayout", { Padding = UDim.new(0, p or 6), SortOrder = Enum.SortOrder.LayoutOrder }) end
 local function pad(t, l, b, r)
-    return new("UIPadding", { PaddingTop = UDim.new(0, t), 
-PaddingLeft = UDim.new(0, l), PaddingBottom = UDim.new(0, b or t), PaddingRight = UDim.new(0, r or l) })
+    return new("UIPadding", { PaddingTop = UDim.new(0, t), PaddingLeft = UDim.new(0, l), PaddingBottom = UDim.new(0, b or t), PaddingRight = UDim.new(0, r or 
+l) })
 end
 local function label(text, size, color, props)
     local p = { Text = text, Font = Enum.Font.Gotham, TextSize = size or 14, TextColor3 = color or T.Text,
@@ -4971,8 +5270,8 @@ local function label(text, size, color, props)
     return new("TextLabel", p)
 end
 
-local Gui = new("ScreenGui", { Name = "BSU2_Hub", 
-ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 50 })
+local Gui = new("ScreenGui", { Name = "BSU2_Hub", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, 
+DisplayOrder = 50 })
 if syn and syn.protect_gui then pcall(syn.protect_gui, Gui) end
 if not pcall(function() Gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end) then
     Gui.Parent = LP:WaitForChild("PlayerGui")
@@ -4980,13 +5279,14 @@ end
 
 local W, H = 780, 480
 local Main = new("Frame", { Size = UDim2.fromOffset(W, H), Position = UDim2.new(0.5, -W / 2, 0.5, -H / 2),
-    BackgroundColor3 = T.Bg, ClipsDescendants = true, Parent = 
-Gui }, { corner(6), new("UIStroke", { Color = T.Stroke }) })
-local Top = new("Frame", { Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = T.Top, Parent = Main })
+    BackgroundColor3 = T.Bg, ClipsDescendants = true, Parent = Gui }, { corner(6), new("UIStroke", { Color = T.Stroke }) })
+local Top = new("Frame", 
+{ Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = T.Top, Parent = Main })
 label("BSU v" .. VERSION, 18, T.Text, { Font = Enum.Font.GothamBold, Size = UDim2.new(0, 110, 1, 0), Position = UDim2.fromOffset(14, 0), Parent = Top })
 label("Bee Swarm Unleashed", 13, Color3.fromRGB(190, 205, 230), { Size = UDim2.new(0, 200, 1, 0), Position = UDim2.fromOffset(110, 1), Parent = Top })
 local CollapseBtn = new("TextButton", { Text = "▼", Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = T.Text,
-    BackgroundTransparency = 1, Size = UDim2.fromOffset(32, 36), Position = UDim2.new(1, -72, 0, 0), Parent = Top })
+    BackgroundTransparency = 1, Size = UDim2.fromOffset(32, 36), Position = UDim2.new(1, -72, 0, 0), 
+Parent = Top })
 local CloseBtn = new("TextButton", { Text = "✕", Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = T.Text,
     BackgroundTransparency = 1, Size = UDim2.fromOffset(32, 36), Position = UDim2.new(1, -38, 0, 0), Parent = Top })
 do -- arrastar
@@ -5002,22 +5302,21 @@ do -- arrastar
             Main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
         end
     end))
-    conn(UIS.InputEnded:Connect(fu
-nction(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+    conn(UIS.InputEnded:Connect(function(i)
+        if i.UserInputType == 
+Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
     end))
 end
 
 local Side = new("Frame", { Position = UDim2.fromOffset(0, 36), Size = UDim2.new(0, 160, 1, -36), BackgroundColor3 = T.Side, Parent = Main })
 local SearchBox = new("TextBox", { Text = "", PlaceholderText = "🔍  Search", Font = Enum.Font.GothamSemibold, TextSize = 14,
-    TextColor3 = T.Text, 
-PlaceholderColor3 = T.Sub, BackgroundColor3 = T.Item, ClearTextOnFocus = false,
+    TextColor3 = T.Text, PlaceholderColor3 = T.Sub, BackgroundColor3 = T.Item, ClearTextOnFocus = false,
     TextXAlignment = Enum.TextXAlignment.Left, Size = UDim2.new(1, -16, 0, 34), Position = UDim2.fromOffset(8, 8), Parent = Side },
     { corner(6), pad(0, 10) })
 new("Frame", { Size = UDim2.new(1, -16, 0, 2), Position = UDim2.fromOffset(8, 50), BackgroundColor3 = T.Stroke, Parent = Side })
 local TabList = new("ScrollingFrame", { Position = UDim2.fromOffset(8, 58), Size = UDim2.new(1, -16, 1, -64), BackgroundTransparency = 1,
-    ScrollBarThickness = 0, 
-CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Parent = Side }, { vlist(6) })
+    ScrollBarThickness = 0, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Parent = 
+Side }, { vlist(6) })
 local Content = new("Frame", { Position = UDim2.fromOffset(168, 44), Size = UDim2.new(1, -176, 1, -52), BackgroundTransparency = 1, Parent = Main })
 
 ------------------------------------------------------------------
@@ -5037,13 +5336,12 @@ end
 
 local W_ = {}
 function W_.toggle(s, p)
-    local row = new("TextButton", { Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1, Text = "", AutoButtonColor = false, 
-Parent = p })
-    local box = new("Frame", { Size = UDim2.fromOffset(24, 24), Position = UDim2.new(0, 0, 0.5, -12), BackgroundColor3 = T.Box, Parent = row }, { corner(5) })
+    local row = new("TextButton", { Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Parent = p })
+    local box = new("Frame", { Size = UDim2.fromOffset(24, 24), 
+Position = UDim2.new(0, 0, 0.5, -12), BackgroundColor3 = T.Box, Parent = row }, { corner(5) })
     local mark = label("✓", 16, T.Text, { Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.fromScale(1, 1), Parent = box })
     label(s.label, 14, T.Text, { Size = UDim2.new(1, -34, 1, 0), Position = UDim2.fromOffset(34, 0), TextTruncate = Enum.TextTruncate.AtEnd, Parent = row })
-    local function render(v) box.BackgroundColor3 = v and 
-T.Accent or T.Box mark.Visible = v and true or false end
+    local function render(v) box.BackgroundColor3 = v and T.Accent or T.Box mark.Visible = v and true or false end
     render(getV(s))
     row.MouseButton1Click:Connect(function() setV(s, not getV(s)) render(getV(s)) end)
     watch(s, row, render)
@@ -5052,15 +5350,13 @@ function W_.slider(s, p)
     local mul = s.mul or 1
     local row = new("Frame", { Size = UDim2.new(1, 0, 0, 42), BackgroundTransparency = 1, Parent = p })
     label(s.label, 14, T.Text, { Size = UDim2.new(1, -60, 0, 20), Parent = row })
-    local val = label("", 13, T.Sub, { Size = UDim2.new(0, 60, 0, 20), Position = UDim2.new(1, 
--60, 0, 0), TextXAlignment = Enum.TextXAlignment.Right, Parent = row })
+    local val = label("", 13, T.Sub, { Size = UDim2.new(0, 60, 0, 20), Position = UDim2.new(1, -60, 0, 0), TextXAlignment = Enum.TextXAlignment.Right, Parent = row })
     local bar = new("Frame", { Size = UDim2.new(1, 0, 0, 8), Position = UDim2.fromOffset(0, 27), BackgroundColor3 = T.Box, Parent = row }, { corner(4) })
     local fill = new("Frame", { Size = UDim2.fromScale(0, 1), BackgroundColor3 = T.Accent, Parent = bar }, { corner(4) })
     local function render(v)
         local ui = (tonumber(v) or 0) * mul
         fill.Size = UDim2.fromScale(math.clamp((ui - s.min) / (s.max - s.min), 0, 1), 1)
-        val.Text = (math.floor(ui) == ui and tostring(ui) or 
-string.format("%.2f", ui)) .. (s.suffix or "")
+        val.Text = (math.floor(ui) == ui and tostring(ui) or string.format("%.2f", ui)) .. (s.suffix or "")
     end
     local function setUI(ui)
         ui = math.clamp(math.floor((ui - s.min) / s.step + 0.5) * s.step + s.min, s.min, s.max)
@@ -5072,27 +5368,28 @@ string.format("%.2f", ui)) .. (s.suffix or "")
     local dragging = false
     local function upd(x) setUI(s.min + (s.max - s.min) * math.clamp((x - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)) end
     bar.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = true upd(i.Position.X) end
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == 
+Enum.UserInputType.Touch then dragging = true upd(i.Position.X) end
     end)
     conn(UIS.InputChanged:Connect(function(i)
         if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then upd(i.Position.X) end
     end))
     conn(UIS.InputEnded:Connect(function(i)
-        if i.UserInputType == 
-Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then 
+dragging = false end
     end))
     watch(s, row, render)
 end
 -- dropdown (uma opção) e multi (várias, valor = { [opção] = true })
 local function dropdownBase(s, p, multi)
     local wrap = new("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Parent = p }, { vlist(3) })
-    local btn = new("TextButton", { Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = T.Item, Text = "", AutoButtonColor = false, Parent 
-= wrap }, { corner(6) })
-    local txt = label("", 15, T.Text, { Font = Enum.Font.GothamSemibold, Size = UDim2.new(1, -36, 1, 0), Position = UDim2.fromOffset(10, 0), TextTruncate = Enum.TextTruncate.AtEnd, Parent = btn })
+    local btn = new("TextButton", { Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = T.Item, Text = "", AutoButtonColor = false, Parent = wrap }, { corner(6) })
+    local txt = label("", 15, T.Text, { Font = 
+Enum.Font.GothamSemibold, Size = UDim2.new(1, -36, 1, 0), Position = UDim2.fromOffset(10, 0), TextTruncate = Enum.TextTruncate.AtEnd, Parent = btn })
     local arrow = label("▼", 13, T.Text, { TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.fromOffset(28, 36), Position = UDim2.new(1, -30, 0, 0), Parent = btn })
     local list = new("ScrollingFrame", { Size = UDim2.new(1, 0, 0, 0), BackgroundColor3 = T.Head, Visible = false, ScrollBarThickness = 3,
-        ScrollBarImageColor3 
-= T.Accent, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Parent = wrap },
+        ScrollBarImageColor3 = T.Accent, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Parent = 
+wrap },
         { corner(6), vlist(3), pad(5, 5) })
     local function opts()
         local o = s.options
@@ -5105,8 +5402,7 @@ local function dropdownBase(s, p, multi)
             local n = 0
             local valid = {}
             for _, o in ipairs(opts()) do valid[o] = true end
-            for k, on in pairs(v or {}) do if on and valid[k] then n += 1 end 
-end
+            for k, on in pairs(v or {}) do if on and valid[k] then n += 1 end end
             txt.Text = s.label .. ": " .. n .. " selecionado(s)"
         else
             txt.Text = s.label .. ": " .. ((s.show and s.show(v)) or tostring(v or "-"))
@@ -5118,9 +5414,9 @@ end
         local o = opts()
         for _, name in ipairs(o) do
             local sel
-            if multi then sel = (getV(s) or {})[name] == true else sel = getV(s) 
-== name end
-            local b = new("TextButton", { Size = UDim2.new(1, -6, 0, 34), BackgroundColor3 = sel and T.Accent or T.Item,
+            if multi then sel = (getV(s) or {})[name] == true else sel = getV(s) == name end
+            local b = new("TextButton", { Size = UDim2.new(1, -6, 0, 34), 
+BackgroundColor3 = sel and T.Accent or T.Item,
                 Text = "   " .. ((s.show and s.show(name)) or name), Font = Enum.Font.GothamSemibold, TextSize = 16, TextColor3 = T.Text,
                 TextXAlignment = Enum.TextXAlignment.Left, AutoButtonColor = true, Parent = list }, { corner(4) })
             b.MouseButton1Click:Connect(function()
@@ -5144,8 +5440,7 @@ end
         open = not open
         if open then rebuild() end
         list.Visible = open
-        arrow.Text = open and "▲" or 
-"▼"
+        arrow.Text = open and "▲" or "▼"
     end)
     title()
     watch(s, wrap, function() title() if open then rebuild() end end)
@@ -5164,7 +5459,8 @@ function W_.text(s, p)
         TextXAlignment = Enum.TextXAlignment.Left, Size = UDim2.new(1, 0, 0, s.list and 48 or 30), Parent = row }, { corner(6), pad(4, 8) })
     box.FocusLost:Connect(function()
         if s.number then
-            local n = tonumber((box.Text:gsub("[^%d%.]", "")))
+            local n = tonumber((box.Text:gsub("[^%d%.]", 
+"")))
             if n then
                 n = math.floor(n)
                 if s.min then n = math.max(n, s.min) end
@@ -5187,16 +5483,14 @@ function W_.text(s, p)
 end
 function W_.button(s, p)
     local b = new("TextButton", { Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = s.color or T.Accent, Text = s.label,
-        Font = Enum.Font.GothamSemibold, 
-TextSize = 14, TextColor3 = T.Text, AutoButtonColor = true, Parent = p }, { corner(6) })
+        Font = Enum.Font.GothamSemibold, TextSize = 14, TextColor3 = T.Text, AutoButtonColor = true, Parent = p }, { corner(6) })
     b.MouseButton1Click:Connect(function() task.spawn(s.fn) end)
 end
 function W_.label(s, p, page)
     local l = label("", s.size or 13, s.color or T.Sub, { Size = UDim2.new(1, 0, 0, 18), AutomaticSize = Enum.AutomaticSize.Y,
         TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, RichText = false, Parent = p })
     table.insert(Labels, { lbl = l, fn = s.fn, page = page })
-    pcall(function() l.Text = s.fn() 
-end)
+    pcall(function() l.Text = s.fn() end)
 end
 function W_.bar(s, p, page)
     local bg = new("Frame", { Size = UDim2.new(1, 0, 0, 24), BackgroundColor3 = T.Box, Parent = p }, { corner(6) })
@@ -5218,27 +5512,26 @@ end
 ------------------------------------------------------------------
 local Pages, TabBtns, TabDefs = {}, {}, {}
 local function makePage()
-    local page = 
-new("ScrollingFrame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ScrollBarThickness = 3,
+    local page = new("ScrollingFrame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, 
+ScrollBarThickness = 3,
         ScrollBarImageColor3 = T.Accent, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Visible = false, Parent = Content })
     local left = new("Frame", { Size = UDim2.new(0.5, -5, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Parent = page }, { vlist(8) })
-    local right = new("Frame", { Size = UDim2.new(0.5, -9, 0, 0), Position = UDim2.new(0.5, 3, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, 
-BackgroundTransparency = 1, Parent = page }, { vlist(8) })
+    local right = new("Frame", { Size = UDim2.new(0.5, -9, 0, 0), Position = UDim2.new(0.5, 3, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Parent = page }, { vlist(8) })
     return page, left, right
 end
 local function makeSection(col, title, key, defaultOpen)
     local sec = new("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = T.Sec, Parent = col }, { corner(6), vlist(0) })
     local head = new("TextButton", { Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = T.Head, Text = "", AutoButtonColor = false, Parent = sec }, { corner(6) })
-    label(title, 15, T.Text, { Font = Enum.Font.GothamBold, Size = UDim2.new(1, -44, 1, 0), Position = 
-UDim2.fromOffset(12, 0), Parent = head })
-    local arrow = label("▼", 15, T.Text, { TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.fromOffset(34, 38), Position = UDim2.new(1, -38, 0, 0), Parent = head })
+    label(title, 15, T.Text, { Font = Enum.Font.GothamBold, Size = UDim2.new(1, -44, 1, 0), Position = UDim2.fromOffset(12, 0), Parent = head })
+    local arrow = label("▼", 15, 
+T.Text, { TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.fromOffset(34, 38), Position = UDim2.new(1, -38, 0, 0), Parent = head })
     local body = new("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Parent = sec }, { vlist(6), pad(10, 12) })
     local open = Cfg.UIOpen[key]
     if open == nil then open = defaultOpen ~= false end
-    local function render() body.Visible = open arrow.Text = 
-open and "▼" or "◀" end
+    local function render() body.Visible = open arrow.Text = open and "▼" or "◀" end
     render()
-    head.MouseButton1Click:Connect(function()
+    head.MouseButton1Click:Connect
+(function()
         open = not open
         if key then Cfg.UIOpen[key] = open end
         render()
@@ -5277,8 +5570,7 @@ function Diag.bubbles()
     table.insert(out, "Abelhas de bolha rastreadas: " .. n)
     for b in pairs(Bub.list) do
         if b.Parent then
-            table.insert(out, string.format("%s 
-dono=%s Type=%s Pop=%s", b:GetFullName(), tostring(Bub.owner[b]),
+            table.insert(out, string.format("%s dono=%s Type=%s Pop=%s", b:GetFullName(), tostring(Bub.owner[b]),
                 tostring(b:GetAttribute("Type")), tostring(b:GetAttribute("Pop"))))
         end
     end
@@ -5301,7 +5593,8 @@ function Diag.tokens()
         local p = U.pos(t)
         if p and hb and F.inside(hb, p, 10) then
             local attrs = {}
-            for k, v in pairs(t:GetAttributes()) do table.insert(attrs, k .. "=" .. tostring(v)) end
+            for k, v in pairs(t:GetAttributes()) do 
+table.insert(attrs, k .. "=" .. tostring(v)) end
             table.insert(out, string.format("%s [%s] dist=%.0f dentro=%s -> %s | %s", t.Name, t.ClassName,
                 hrp and (p - hrp.Position).Magnitude or -1, tostring(F.inside(hb, p)), Tok.why(t), table.concat(attrs, " ")))
         end
@@ -5310,18 +5603,18 @@ function Diag.tokens()
 end
 function Diag.buffs()
     local b = Boost.buffFolder()
-    local out = { "Buffs: " .. tostring(b 
-and b:GetFullName()) }
+    local out = { "Buffs: " .. tostring(b and b:GetFullName()) }
     if b then
-        for _, c in ipairs(b:GetChildren()) do
+        for _, c in 
+ipairs(b:GetChildren()) do
             table.insert(out, "== " .. c.Name .. " [" .. c.ClassName .. "]")
             for k, v in pairs(c:GetAttributes()) do table.insert(out, "   @" .. k .. "=" .. tostring(v)) end
             for _, d in ipairs(c:GetDescendants()) do
                 local line = "   " .. d:GetFullName():sub(#c:GetFullName() + 2) .. " [" .. d.ClassName .. "]"
                 if d:IsA("TextLabel") or d:IsA("TextButton") then line ..= " = " .. d.Text end
-                if d:IsA("GuiObject") and d.Name:lower():find("bar") then 
-line ..= " size=" .. tostring(d.Size) end
-                for k, v in pairs(d:GetAttributes()) do line ..= " @" .. k .. "=" .. tostring(v) end
+                if d:IsA("GuiObject") and d.Name:lower():find("bar") then line ..= " size=" .. tostring(d.Size) end
+                for k, v in pairs(d:GetAttributes()) do line ..= " 
+@" .. k .. "=" .. tostring(v) end
                 table.insert(out, line)
             end
         end
@@ -5333,8 +5626,7 @@ function Diag.boosters()
     local out = {}
     for _, k in ipairs(Boost.KNOWN) do
         local pp = Boost.prompts[k.name]
-        table.insert(out, string.format("%s: prompt=%s | lugar=%s", k.name, pp and 
-pp:GetFullName() or "nenhum",
+        table.insert(out, string.format("%s: prompt=%s | lugar=%s", k.name, pp and pp:GetFullName() or "nenhum",
             tostring(Boost.where and Boost.where[k.name])))
     end
     table.insert(out, "== prompts com 'booster' ==")
@@ -5358,7 +5650,8 @@ local Decl = { q = nil, npc = nil }
 local function questOptions()
     local u, k = {}, {}
     for n in pairs(Quest.read()) do
-        if Quest.owner[n] then table.insert(k, n) else table.insert(u, n) end
+        if Quest.owner[n] then 
+table.insert(k, n) else table.insert(u, n) end
     end
     table.sort(u) table.sort(k)
     for _, n in ipairs(k) do table.insert(u, n) end
@@ -5369,9 +5662,9 @@ end
 -- FICHAS DAS ABAS
 ------------------------------------------------------------------
 local function fieldNames() return F.names() end
-local function sec(title, key, items, 
-open) return { title = title, key = key, items = items, open = open } end
-local function tg(key, lbl, extra) local s = { t = "toggle", key = key, label = lbl } for k, v in pairs(extra or {}) do s[k] = v end return s end
+local function sec(title, key, items, open) return { title = title, key = key, items = items, open = open } end
+local function tg(key, lbl, extra) 
+local s = { t = "toggle", key = key, label = lbl } for k, v in pairs(extra or {}) do s[k] = v end return s end
 local function sl(key, lbl, min, max, step, extra)
     local s = { t = "slider", key = key, label = lbl, min = min, max = max, step = step }
     for k, v in pairs(extra or {}) do s[k] = v end
@@ -5395,7 +5688,8 @@ end
 function HivePicker.open()
     HivePicker.close()
     local cs = Bees.cells()
-    if not cs then Bees.status = "Colmeia não encontrada (dê claim)" return end
+    if not cs then Bees.status = 
+"Colmeia não encontrada (dê claim)" return end
     local cells = {}
     for _, c in ipairs(cs:GetChildren()) do
         local i = Bees.cellInfo(c)
@@ -5406,20 +5700,20 @@ function HivePicker.open()
     -- igual à colmeia: colunas em pé, linha mais alta em cima, colunas pares meia célula pra baixo (hexágono)
     local SZ, GAP = 56, 5
     local maxY = 1
-    for _, i in ipairs(cells) do maxY = math.max(maxY, i.y) end
+    for _, i in ipairs(cells) do maxY = 
+math.max(maxY, i.y) end
     local w = 5 * (SZ + GAP) + 30
     local hCanvas = maxY * (SZ + GAP) + SZ / 2 + 8
     local hFrame = math.min(hCanvas + 96, 600)
     local f = new("Frame", { Size = UDim2.fromOffset(w, hFrame), Position = UDim2.new(0.5, -w / 2, 0.5, -hFrame / 2), BackgroundColor3 = T.Bg,
         ZIndex = 20, Parent = Gui }, { corner(8), new("UIStroke", { Color = T.Stroke, Thickness = 1 }) })
     HivePicker.frame = f
-    new("Frame", { Size = UDim2.new(1, 0, 0, 36), 
-BackgroundColor3 = T.Top, ZIndex = 21, Parent = f }, { corner(8),
-        label("Select Position", 16, T.Text, { Font = Enum.Font.GothamBold, Size = UDim2.new(1, -20, 1, 0), Position = UDim2.fromOffset(12, 0), ZIndex = 22 }) })
+    new("Frame", { Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = T.Top, ZIndex = 21, Parent = f }, { corner(8),
+        label("Select Position", 
+16, T.Text, { Font = Enum.Font.GothamBold, Size = UDim2.new(1, -20, 1, 0), Position = UDim2.fromOffset(12, 0), ZIndex = 22 }) })
     local grid = new("ScrollingFrame", { Size = UDim2.new(1, -16, 1, -96), Position = UDim2.fromOffset(8, 44), BackgroundColor3 = Color3.fromRGB(205, 165, 30),
         ScrollBarThickness = 4, ScrollBarImageColor3 = T.Accent, CanvasSize = UDim2.fromOffset(0, hCanvas), ZIndex = 21, Parent = f }, { corner(6) })
-    -- cor da célula: a parte mais 
-colorida entre Cell/Backplate (a Faceplate é transparente)
+    -- cor da célula: a parte mais colorida entre Cell/Backplate (a Faceplate é transparente)
     local function cellColor(i)
         local best, sat = nil, -1
         for _, n in ipairs({ "Cell", "Backplate" }) do
@@ -5434,22 +5728,23 @@ colorida entre Cell/Backplate (a Faceplate é transparente)
     end
     for _, i in ipairs(cells) do
         local face = i.cell:FindFirstChild("Faceplate")
-        local decal = face and face:FindFirstChildWhichIsA("Decal")
+        local decal = face and face:Find
+FirstChildWhichIsA("Decal")
         local px = 6 + (i.x - 1) * (SZ + GAP)
         local py = 4 + (maxY - i.y) * (SZ + GAP) + ((i.x % 2 == 0) and SZ / 2 or 0)
         local b = new("ImageButton", { Size = UDim2.fromOffset(SZ, SZ), Position = UDim2.fromOffset(px, py),
             BackgroundColor3 = i.bee and cellColor(i) or Color3.fromRGB(120, 95, 20), Image = (i.bee and decal) and decal.Texture or "",
-            ScaleType = Enum.ScaleType.Fit, 
-AutoButtonColor = true, ZIndex = 22, Parent = grid }, { corner(14) })
-        if Cfg.HiveSlot == i.slot then new("UIStroke", { Color = T.Green, Thickness = 3, Parent = b }) end
+            ScaleType = Enum.ScaleType.Fit, AutoButtonColor = true, ZIndex = 22, Parent = grid }, { corner(14) })
+        if Cfg.HiveSlot == i.slot then 
+new("UIStroke", { Color = T.Green, Thickness = 3, Parent = b }) end
         if i.gifted then
             label("★", 16, Color3.fromRGB(255, 210, 60), { Font = Enum.Font.GothamBold, Size = UDim2.fromOffset(18, 18), Position = UDim2.new(1, -19, 0, 1),
                 TextStrokeTransparency = 0.3, ZIndex = 23, Parent = b })
         end
         label(i.bee and tostring(i.level) or "", 15, T.Text, { Font = Enum.Font.GothamBold, Size = UDim2.fromOffset(20, 18),
-            Position = UDim2.fromOffset(3, 1), 
-TextStrokeTransparency = 0.1, ZIndex = 23, Parent = b })
-        b.MouseButton1Click:Connect(function()
+            Position = UDim2.fromOffset(3, 1), TextStrokeTransparency = 0.1, ZIndex = 23, Parent = b })
+        b.MouseButton1Click:Connect(f
+unction()
             setCfg("HiveSlot", i.slot)
             Bees.status = "Slot escolhido: " .. Bees.slotText(i.slot)
             HivePicker.close()
@@ -5457,8 +5752,7 @@ TextStrokeTransparency = 0.1, ZIndex = 23, Parent = b })
     end
     local close = new("TextButton", { Size = UDim2.fromOffset(120, 32), Position = UDim2.new(0.5, -60, 1, -42), BackgroundColor3 = T.Box,
         Text = "Close", Font = Enum.Font.GothamBold, TextSize = 15, TextColor3 = T.Text, ZIndex = 22, Parent = f }, { corner(6) })
-    
-close.MouseButton1Click:Connect(HivePicker.close)
+    close.MouseButton1Click:Connect(HivePicker.close)
 end
 
 TabDefs = {
@@ -5468,8 +5762,7 @@ TabDefs = {
               { t = "bar", fn = function() local p, c = U.pollen(), U.cap() return p / c, string.format("Pólen %s / %s (%d%%)", U.short(p), U.short(c), math.floor(p / c * 100)) end },
               lb(function() return "Tarefa: " .. St.task end),
               lb(function() return "Motivo: " .. (St.reason ~= "" and St.reason or "-") end),
-              lb(function() return "Ação: " .. (St.action ~= "" and St.action or "-") 
-end),
+              lb(function() return "Ação: " .. (St.action ~= "" and St.action or "-") end),
               lb(function() local h = Hive.mine() return "Colmeia: " .. (h and h.Name or ("nenhuma " .. Hive.status)) end),
               lb(function() return "Último erro: " .. ((St.err and St.err.last or "-"):match("^[^\n]*")) end),
           }),
@@ -5479,8 +5772,7 @@ end),
                       Sched.abort = true
                       Move.cancel()
                       local hum, hrp = U.hum(), U.hrp()
-                      if hrp then hrp.Anchored = false 
-end
+                      if hrp then hrp.Anchored = false end
                       if hum and hrp then hum:MoveTo(hrp.Position) end
                       act("Pausado: jogando na mão")
                   end
@@ -5491,17 +5783,16 @@ end
       right = {
           sec("Sessão", "home_session", {
               lb(function() return "Mel: " .. U.fmtNum(U.honey()) end),
-              lb(function() return "Ganho na sessão: " .. U.fmtNum(U.honey() - St.startHoney) 
-end),
+              lb(function() return "Ganho na sessão: " .. U.fmtNum(U.honey() - St.startHoney) end),
               lb(function() return "Honey Per Hour: " .. U.fmtNum(hpH()) .. "  (" .. U.short(hpH()) .. ")" end),
-              lb(function() return "Tempo: " .. U.fmtTime(tick() - St.startT) end),
+              lb(function() return 
+"Tempo: " .. U.fmtTime(tick() - St.startT) end),
               lb(function() return string.format("Mobs mortos: %d | Hits levados: %d | Quests: %d", St.kills, St.hits, St.quests) end),
           }),
           sec("Campo atual", "home_field", {
               lb(function() local f, why = Farm.field() return "Campo: " .. U.fname(f) .. " (" .. tostring(why) .. ")" end),
               lb(function() return Sprout.statusText() end),
-              lb(function() return 
-Mark.statusText(curHB()) end),
+              lb(function() return Mark.statusText(curHB()) end),
               lb(function() return Bub.statusText(curHB()) end),
           }),
           sec("Console", "home_console", {
@@ -5516,15 +5807,15 @@ Mark.statusText(curHB()) end),
     { name = "Farming", icon = "🌻",
       left = {
           sec("Farming", "farm_main", {
-              { t = "dropdown", key = "Field", label = "Field", options = fieldNames, show = function(v) return U.fname(v) end },
+              { t = "dropdown", key = 
+"Field", label = "Field", options = fieldNames, show = function(v) return U.fname(v) end },
               tg("AutoFarm", "Autofarm"), tg("AutoTool", "Auto Tool (bater sempre)"),
               { t = "dropdown", key = "Sprinkler", label = "Sprinkler",
                 options = function() return Spr.ORDER end },
               tg("AutoSprinkler", "Auto Sprinkler"),
               lb(function() return "Sprinkler: " .. Spr.current() .. "\nÚltimo: " .. Spr.status end),
           }),
-          sec("Farm Settings", 
-"farm_settings", {
+          sec("Farm Settings", "farm_settings", {
               sl("ToolRange", "Alcance da ferramenta (grade)", 4, 20, 1),
               sl("EdgeMargin", "Margem da borda", 0, 15, 1),
               sl("FieldRandom", "Aleatoriedade", 5, 100, 5, { suffix = "%" }),
@@ -5533,15 +5824,14 @@ Mark.statusText(curHB()) end),
           }, false),
           sec("Convert Settings", "farm_convert", {
               tg("AutoConvert", "Auto Convert"),
-              sl("ConvertPercent", 
-"Converter com a bolsa em", 50, 100, 5, { suffix = "%" }),
-              tg("UseTicketConverters", "Use Ticket Converters (gasta 1 Medal)"),
+              sl("ConvertPercent", "Converter com a bolsa em", 50, 100, 5, { suffix = "%" }),
+              tg("UseTicketConverters", 
+"Use Ticket Converters (gasta 1 Medal)"),
               sl("ConverterCD", "Cooldown de cada converter", 5, 60, 1, { suffix = " min" }),
               lb(function() return Cfg.UseTicketConverters and TConv.statusText() or "Ticket Converters: desligado" end),
               tg("UseMicroConverters", "Convert with Micro Converters"),
               sl("MicroCD", "Cooldown custom do Micro Converter (0 = só o do jogo)", 0, 60, 1, { suffix = " min" }),
-              { t = "text", key = "MicroKeep", label = "Guardar no 
-inventário (só usa se tiver mais que isso)", number = true, min = 0, max = 999999 },
+              { t = "text", key = "MicroKeep", label = "Guardar no inventário (só usa se tiver mais que isso)", number = true, min = 0, max = 999999 },
               lb(function() return Micro.statusText() end),
               sl("HiveEdgeMargin", "Margem da borda da colmeia", 0, 9, 0.5),
               sl("ConvertSettle", "Esperar o mel parar", 2, 15, 1, { suffix = "s" }),
@@ -5552,30 +5842,31 @@ inventário (só usa se tiver mais que isso)", number = true, min = 0, max = 999
       right = {
           sec("Sprout Settings", "farm_sprout", {
               tg("AutoSprout", "Farm Sprouts"),
-              sl("SproutLootTime", "Tempo de loot depois de quebrar", 10, 90, 5, { suffix = "s" }),
+              sl("SproutLootTime", 
+"Tempo de loot depois de quebrar", 10, 90, 5, { suffix = "s" }),
               tg("SproutRarePlus", "Rare+ (farma todas menos Basic)"),
               tg("SproutAllTokens", "Collect every token in the field while farming sprouts"),
               sl("SproutTokenDelay", "Pegar cada token com quantos segundos de vida", 0.1, 2, 0.05, { suffix = "s" }),
               lb(function()
                   if not firetouchinterest then return "Seu executor não tem firetouchinterest (não funciona)" end
-                  return "Tokens pegos na 
-sprout: " .. SproutTok.count
+                  return "Tokens pegos na sprout: " .. SproutTok.count
               end),
-              tg("BeanOn", "Plantar sprouts com Magic Bean", { cb = function(v) if v then Bean.planted = 0 end end }),
+              tg("BeanOn", "Plantar 
+sprouts com Magic Bean", { cb = function(v) if v then Bean.planted = 0 end end }),
               { t = "dropdown", key = "BeanField", label = "Field pra plantar", options = fieldNames,
                 show = function(v) return (v == "" or v == nil) and "-" or U.fname(v) end },
               { t = "text", key = "BeanCount", label = "Quantas sprouts plantar (digite o número)", number = true, min = 1, max = 9999 },
               sl("BeanDelay", "Plantar a próxima depois de quebrar", 1, 15, 1, { suffix = "s" }),
               lb(function()
-                  return string.format("Plantadas: %d/%d | Magic Beans: %d\nÚltimo: %s", Bean.planted, Cfg.BeanCount, Inv.count("Magic Bean"), Bean.status)
+                  return string.format("Plantadas: %d/
+%d | Magic Beans: %d\nÚltimo: %s", Bean.planted, Cfg.BeanCount, Inv.count("Magic Bean"), Bean.status)
               end),
               bt("Zerar contador", function() Bean.planted = 0 end),
               lb(function() return Sprout.statusText() end),
           }),
           sec("Marks", "farm_marks", {
               tg("StayInMarks", "Farm Marks (maior network de marks)"),
-              { t = "dropdown", key = "MarkPrefer", label = "Desempate: preferir", options = { "HoneyMark+", "PollenMark+", 
-"PollenMark" } },
+              { t = "dropdown", key = "MarkPrefer", label = "Desempate: preferir", options = { "HoneyMark+", "PollenMark+", "PollenMark" } },
               lb(function() return Mark.statusText(curHB()) end),
           }, false),
           sec("Bubbles", "farm_bubbles", {
@@ -5587,16 +5878,15 @@ sprout: " .. SproutTok.count
     { name = "Tokens", icon = "🎯",
       left = {
           sec("Tokens", "tok_main", {
-              tg("AutoTokens", "Auto coletar tokens"), 
-tg("OnlyMyTokens", "Ignorar tokens de outros players"),
-              tg("IgnoreBomb", "Ignorar Bombs"), tg("IgnoreBoost", "Ignorar Boosts"),
+              tg("AutoTokens", "Auto coletar tokens"), tg("OnlyMyTokens", "Ignorar tokens de outros players"),
+              tg("IgnoreBomb", "Ignorar 
+Bombs"), tg("IgnoreBoost", "Ignorar Boosts"),
               tg("RemoteCollect", "Coleta à distância (teste)"),
               lb(function()
                   if not firetouchinterest then return "Coleta à distância: seu executor não tem firetouchinterest" end
                   return string.format("Coleta à distância: %d toques (campo: %s). Funciona com Stop Everything.", Remote.touches, Remote.last ~= "" and Remote.last or "-")
               end),
-              { t = "text", key = 
-"TokenPriority", label = "Prioridade extra (vírgula)", list = true, placeholder = "ex: Link, Haste" },
+              { t = "text", key = "TokenPriority", label = "Prioridade extra (vírgula)", list = true, placeholder = "ex: Link, Haste" },
               { t = "text", key = "TokenBlacklist", label = "Nunca pegar (vírgula)", list = true },
               { t = "text", key = "AbilityTokens", label = "Tokens de habilidade (ignorados no loot da sprout)", list = true },
           }),
@@ -5627,8 +5917,7 @@ tg("OnlyMyTokens", "Ignorar tokens de outros players"),
               { t = "multi", key = "KillMobs", label = "Mobs", options = function() return Mob.names end },
               tg("KillOnlyAfterConvert", "Só depois de converter"),
               tg("FieldMobDodge", "Lutar com mob no campo do farm"),
-              lb(function() return "Vai só em campos liberados; chegando 
-lá mata TODOS os mobs daquele campo." end),
+              lb(function() return "Vai só em campos liberados; chegando lá mata TODOS os mobs daquele campo." end),
           }),
       },
       right = {
@@ -5648,8 +5937,7 @@ lá mata TODOS os mobs daquele campo." end),
               tg("QuestField", "Farmar no campo que a quest pede"),
               { t = "dropdown", key = "BestBlue", label = "Best Blue Field",
                 options = function() local o = Quest.colorOptions("blue") table.insert(o, 1, "Automático") return o end,
-                show = function(v) return (v == "" or v == nil) and 
-"Automático" or U.fname(v) end },
+                show = function(v) return (v == "" or v == nil) and "Automático" or U.fname(v) end },
               { t = "dropdown", key = "BestRed", label = "Best Red Field",
                 options = function() local o = Quest.colorOptions("red") table.insert(o, 1, "Automático") return o end,
                 show = function(v) return (v == "" or v == nil) and "Automático" or U.fname(v) end },
@@ -5657,13 +5945,13 @@ lá mata TODOS os mobs daquele campo." end),
                 options = function() local o = Quest.colorOptions("white") table.insert(o, 1, "Automático") return o end,
                 show = function(v) return (v == "" or v == nil) and "Automático" or U.fname(v) end },
               tg("QuestMobs", "Matar mobs que a quest pede"),
-              tg("QuestKillBoss", "Kill Boss (Royal Beetle / Shadow Bear) pra quest"),
+              tg("QuestKillBoss", "Kill 
+Boss (Royal Beetle / Shadow Bear) pra quest"),
               tg("FeedForQuests", "Feed Bees For Quests"),
               lb(function() return Cfg.FeedForQuests and ("Feed: " .. Bees.questStatus) or "Feed: desligado (Raise Level fica manual)" end),
               tg("QuestAfterConvert", "Só entregar/pegar depois de converter"),
               sl("TalkDelay", "Delay do diálogo", 0.05, 1, 0.05, { suffix = "s" }),
-              sl("QuestInterval", "Re-tentar urso sem quest após", 30, 
-900, 10, { suffix = "s" }),
+              sl("QuestInterval", "Re-tentar urso sem quest após", 30, 900, 10, { suffix = "s" }),
               bt("Visitar ursos agora", function()
                   for _, n in ipairs(Quest.npcNames()) do if Quest.active(n) then Quest.forced[n] = true end end
                   Quest.cooldown = {}
@@ -5695,9 +5983,9 @@ lá mata TODOS os mobs daquele campo." end),
               { t = "dropdown", label = "Quest", options = questOptions,
                 get = function() return Decl.q end, set = function(v) Decl.q = v end,
                 show = function(v) if not v then return "-" end return v .. (Quest.owner[v] and (" [" .. Quest.owner[v] .. "]") or " [?]") end },
-              { t = "dropdown", label = 
-"Urso", options = function() return Quest.npcNames() end,
-                get = function() return Decl.npc end, set = function(v) Decl.npc = v end },
+              { t = "dropdown", label = "Urso", options = function() return Quest.npcNames() end,
+                get = function() return 
+Decl.npc end, set = function(v) Decl.npc = v end },
               bt("Salvar dono", function()
                   if Decl.q and Decl.npc then
                       Quest.setOwner(Decl.q, Decl.npc, "declarado")
@@ -5709,7 +5997,8 @@ lá mata TODOS os mobs daquele campo." end),
           }, false),
       },
       right = {
-          sec("Quests ativas", "q_list", { lb(function() return Quest.statusText() end) }),
+          sec("Quests ativas", 
+"q_list", { lb(function() return Quest.statusText() end) }),
       } },
     { name = "Campos", icon = "🗺️",
       left = {
@@ -5718,7 +6007,8 @@ lá mata TODOS os mobs daquele campo." end),
               { t = "multi", key = "Unlocked", label = "Allowed Fields", options = fieldNames, show = function(v) return U.fname(v) end },
               lb(function()
                   local t = {}
-                  for _, n in ipairs(F.names()) do if F.unlocked(n) then table.insert(t, U.fname(n)) end end
+                  for _, n in ipairs(F.names()) do if 
+F.unlocked(n) then table.insert(t, U.fname(n)) end end
                   return "Liberados: " .. (#t > 0 and table.concat(t, ", ") or "nenhum")
               end),
           }),
@@ -5737,9 +6027,9 @@ lá mata TODOS os mobs daquele campo." end),
               tg("WebhookOn", "Ativar webhook"),
               { t = "text", key = "WebhookURL", label = "URL do webhook do Discord", placeholder = "https://discord.com/api/webhooks/..." },
               { t = "text", key = "WebhookPing", label = "Seu ID do Discord (pra marcar em itens/morte)", placeholder = "opcional" },
-              sl("WebhookInterval", 
-"Status a cada", 5, 180, 5, { suffix = " min" }),
-              bt("Enviar teste", function() Hook.test() end),
+              sl("WebhookInterval", "Status a cada", 5, 180, 5, { suffix = " min" }),
+              bt("Enviar teste", 
+function() Hook.test() end),
               bt("Enviar status agora", function() Hook.post({ embeds = { { title = "📊 Status", color = 0x2F5AA0, fields = Hook.statsFields(),
                   description = "__Itens na sessão__\n" .. Hook.itemsText(),
                   footer = { text = "BSU v" .. VERSION .. " • " .. LP.Name } } } }) end),
@@ -5748,16 +6038,15 @@ lá mata TODOS os mobs daquele campo." end),
       right = {
           sec("Avisos", "wh_events", {
               tg("WebhookItems", "Itens únicos (Egg, Star Jelly...)"),
-              tg("WebhookQuests", "Quest 
-entregue"),
+              tg("WebhookQuests", "Quest entregue"),
               tg("WebhookDeath", "Morte"),
               tg("WebhookDisconnect", "Desconectou / kick"),
               { t = "text", key = "GraphWebhookURL", label = "Webhook dos gráficos (vazio = o mesmo de cima)", placeholder = "https://discord.com/api/webhooks/..." },
               tg("StatsOn", "Relatório completo (BSU Stats)"),
               { t = "text", key = "StatsURL", label = "Endereço do BSU Stats (Render)", placeholder = "https://bsu-stats.onrender.com" },
-              { t = "text", key = "StatsSecret", label = "Senha do BSU Stats (SECRET)", placeholder = "a 
-mesma do Render" },
-              bt("Enviar relatório completo agora", function() task.spawn(Stats.send) end),
+              { t = "text", key = "StatsSecret", label = "Senha do BSU Stats (SECRET)", placeholder = "a mesma do Render" },
+              bt("Enviar relatório completo agora", function() 
+task.spawn(Stats.send) end),
               lb(function() return "BSU Stats: " .. Stats.status end),
               lb(function() return "Status: " .. Hook.status .. (Hook.req and "" or " (seu executor não tem request)") end),
           }),
@@ -5767,8 +6056,7 @@ mesma do Render" },
           sec("Geral", "cfg_main", {
               tg("AntiAFK", "Anti-AFK"),
               lb(function() return "RightShift = mostrar/esconder a GUI" end),
-              bt("Salvar config agora", 
-function() saveCfg() end),
+              bt("Salvar config agora", function() saveCfg() end),
               bt("Resetar config (padrão)", function()
                   for k, v in pairs(Defaults) do setCfg(k, deepcopy(v)) end
                   saveCfg()
@@ -5788,17 +6076,16 @@ function() saveCfg() end),
               tg("RequireBooster", "Require Field Booster (só renova boost de booster)"),
               tg("StaggerBoosters", "Stagger Boosters (15 min entre boosts bons)"),
               { t = "multi", key = "BoostFields", label = "Allowed Fields", options = fieldNames, show = function(v) return U.fname(v) end },
-              { t = "multi", key = "Boosters", label = "Allowed 
-Boosters", options = function() return Boost.names() end },
-              tg("UseDice", "Usar Field Dice pra renovar"),
+              { t = "multi", key = "Boosters", label = "Allowed Boosters", options = function() return Boost.names() end },
+              tg("UseDice", "Usar Field 
+Dice pra renovar"),
               tg("UseGlitter", "Usar Glitter pra renovar"),
               tg("ExtendOnce", "Estender só uma vez (por booster)"),
               sl("MinBoostFarm", "Minimum Field Boost To Farm", 1, 10, 1),
               sl("WantedBoost", "Wanted Field Boost", 1, 10, 1),
               sl("RenewTime", "Min Time Left To Roll Dice", 10, 300, 5, { suffix = "s" }),
               sl("MaxDicePerRenew", "Máximo de dados por renovação", 1, 50, 1),
-              bt("Procurar boosters de 
-novo", function() Boost.scan() end),
+              bt("Procurar boosters de novo", function() Boost.scan() end),
               lb(function()
                   local st = ""
                   if Cfg.StaggerBoosters and tick() < Boost.staggerUntil then st = "\nPróximo booster em " .. U.fmtTime(Boost.staggerUntil - tick()) end
@@ -5808,9 +6095,9 @@ novo", function() Boost.scan() end),
       },
       right = {
           sec("Materials", "toy_mats", (function()
-              local items = 
-{ tg("AutoMaterials", "Auto Materials") }
-              for _, m in ipairs(Mat.LIST) do
+              local items = { tg("AutoMaterials", "Auto Materials") }
+              for _, m in ipairs(Mat.LIST) 
+do
                   table.insert(items, { t = "toggle", label = m.name,
                       get = function() return Mat.cfg(m.name).on end,
                       set = function(v) Mat.cfg(m.name).on = v end })
@@ -5819,7 +6106,8 @@ novo", function() Boost.scan() end),
                       get = function() return Mat.cfg(m.name).interval end,
                       set = function(v) Mat.cfg(m.name).interval = v end })
               end
-              table.insert(items, lb(function() return Mat.statusText() end))
+              table.insert(items, lb(function() return 
+Mat.statusText() end))
               return items
           end)()),
       } },
@@ -5831,25 +6119,26 @@ novo", function() Boost.scan() end),
                 show = function(v) return Bees.slotText(v) end },
               tg("AutoGiftedBasic", "Auto Gifted Basic Bee"),
               tg("BuyBasicEggs", "Purchase Basic Eggs"),
-              sl("EggBuyAmount", "Amount To Purchase", 1, 100, 1),
+              sl("EggBuyAmount", 
+"Amount To Purchase", 1, 100, 1),
               lb(function() return "Basic Egg: " .. Inv.count("Basic Egg") .. "\n" .. Bees.status end),
           }),
           sec("Royal Jelly", "hv_rj", {
               tg("AutoRJ", "Auto Royal Jelly"),
               tg("RJStopGifted", "Stop On Any Gifted"),
               { t = "multi", key = "RJBeeTypes", label = "Bee Types", options = function() return Bees.rjTypes() end },
-              { t = "multi", key = "RJStopRarity", label = "Stop On Bee Rarity", options = 
-Bees.RJ_RARITIES },
-              lb(function() return "Royal Jelly: " .. Inv.count("Royal Jelly") .. " | Slot: " .. Bees.slotText(Cfg.HiveSlot) .. "\n" .. Bees.rjStatus end),
+              { t = "multi", key = "RJStopRarity", label = "Stop On Bee Rarity", options = Bees.RJ_RARITIES },
+              lb(function() return "Royal Jelly: " .. Inv.count("Royal 
+Jelly") .. " | Slot: " .. Bees.slotText(Cfg.HiveSlot) .. "\n" .. Bees.rjStatus end),
           }),
       },
       right = {
           sec("Feed Until Gifted", "hv_feed", {
               tg("FeedGifted", "Feed Until Gifted"),
               { t = "text", key = "FeedAmount", label = "Quantidade por vez (digite)", number = true, min = 1, max = 99999 },
-              { t = "text", key = "FeedLimit", label = "Limite total (digite)", number = true, min = 1, 
-max = 9999999 },
-              lb(function() return Bees.favText() .. "\n" .. Bees.feedStatus end),
+              { t = "text", key = "FeedLimit", label = "Limite total (digite)", number = true, min = 1, max = 9999999 },
+              lb(function() return Bees.favText() .. "\n" .. 
+Bees.feedStatus end),
           }),
           sec("Level Up Hive", "hv_lvl", {
               tg("AutoLevelHive", "Auto Level Up Hive"),
@@ -5861,7 +6150,8 @@ max = 9999999 },
               lb(function()
                   local t = {}
                   for _, i in ipairs(Bees.list()) do
-                      table.insert(t, string.format("%s  %s Lv%d%s", i.slot, i.name or "?", i.level, i.gifted and " ★" or ""))
+                      table.insert(t, 
+string.format("%s  %s Lv%d%s", i.slot, i.name or "?", i.level, i.gifted and " ★" or ""))
                   end
                   return #t > 0 and table.concat(t, "\n") or "Colmeia não encontrada"
               end),
@@ -5908,14 +6198,16 @@ for _, tab in ipairs(TabDefs) do
         local body = makeSection(right, s.title, s.key, s.open)
         for _, it in ipairs(s.items) do build(it, body, page) end
     end
-    local b = new("TextButton", { Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = T.Side, Text = "", AutoButtonColor = false, Parent = TabList }, { corner(6) })
+    local b = new("TextButton", { Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = T.Side, Text = 
+"", AutoButtonColor = false, Parent = TabList }, { corner(6) })
     label(tab.icon, 15, T.Text, { TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.fromOffset(30, 36), Position = UDim2.fromOffset(4, 0), Parent = b })
     label(tab.name, 15, T.Text, { Font = Enum.Font.GothamSemibold, Size = UDim2.new(1, -40, 1, 0), Position = UDim2.fromOffset(38, 0), Parent = b })
     TabBtns[tab.name] = b
     b.MouseButton1Click:Connect(function() SearchBox.Text = "" selectPage(tab.name) end)
 end
 
--- BUSCA: mostra as opções que batem com o texto (mesmas fichas, sincronizadas)
+-- BUSCA: mostra as opções que 
+batem com o texto (mesmas fichas, sincronizadas)
 local SearchPage, SLeft, SRight = makePage()
 Pages.__search = SearchPage
 local lastTab = "Home"
@@ -5938,7 +6230,8 @@ local function runSearch(q)
         end
         for _, s in ipairs(tab.right) do
             local hits = {}
-            for _, it in ipairs(s.items) do if it.label and it.label:lower():find(q, 1, true) then table.insert(hits, it) end end
+            for _, it in ipairs(s.items) do if it.label and it.label:lower():find(q, 
+1, true) then table.insert(hits, it) end end
             if #hits > 0 then
                 n += 1
                 local body = makeSection(n % 2 == 1 and SLeft or SRight, tab.name .. " › " .. s.title, nil, true)
@@ -5989,9 +6282,9 @@ CollapseBtn.MouseButton1Click:Connect(function()
     Main.Size = collapsed and UDim2.fromOffset(W, 36) or UDim2.fromOffset(W, H)
     CollapseBtn.Text = collapsed and "◀" or "▼"
 end)
-conn(UIS.InputBegan
-:Connect(function(i, gp)
-    if not gp and i.KeyCode == Enum.KeyCode.RightShift then Gui.Enabled = not Gui.Enabled end
+conn(UIS.InputBegan:Connect(function(i, gp)
+    if not gp and i.KeyCode == 
+Enum.KeyCode.RightShift then Gui.Enabled = not Gui.Enabled end
 end))
 
 ------------------------------------------------------------------
@@ -6003,7 +6296,8 @@ Env.Destroy = function()
     if Fight.dirty then writeJSON(FILES.mobs, Fight.data) end
     Env.Running = false
     Move.cancel()
-    pcall(function() local h = U.hrp() if h then h.Anchored = false end end)
+    pcall(function() local h = U.hrp() 
+if h then h.Anchored = false end end)
     pcall(function() if DefaultWS and U.hum() then U.hum().WalkSpeed = DefaultWS end end)
     for _, c in ipairs(Env.Conns) do pcall(function() c:Disconnect() end) end
     pcall(function() Gui:Destroy() end)
@@ -6011,8 +6305,8 @@ end
 CloseBtn.MouseButton1Click:Connect(function() Env.Destroy() end)
 
 task.spawn(function()
-    while running() do task.wait(3) 
-saveCfg() end
+    while running() do task.wait(3) saveCfg() end
 end)
-print("[BSU] v" .. VERSION .. " carregado! RightShift para mostrar/esconder.")
+print("[BSU] v" .. VERSION .. " 
+carregado! RightShift para mostrar/esconder.")
 end)()
