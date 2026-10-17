@@ -1,5 +1,5 @@
 --[[
-    BSU v1.0.8 — Bee Swarm Unleashed
+    BSU v1.1.5 — Bee Swarm Unleashed
     Reescrito do zero:
       * fila de tarefas por prioridade (cada tarefa diz SE quer rodar e POR QUÊ)
       * interrupção padronizada (token raro, colmeia, etc. param o que estiver rodando)
@@ -16,7 +16,7 @@ if _G.BSU2 and _G.BSU2.Destroy then pcall(_G.BSU2.Destroy) end
 if _G.BSU and _G.BSU.Destroy then pcall(_G.BSU.Destroy) end
 task.wait(0.15)
 
-local VERSION = "1.0.8"
+local VERSION = "1.1.5"
 local Env = { Running = true, Conns = {} }
 _G.BSU2 = Env
 
@@ -108,7 +108,7 @@ local Defaults = {
     FightJump = false, LootRadius = 35,
     -- Quests
     AutoQuest = false, QuestNPCs = {}, QuestClaim = {}, QuestField = false, QuestMobs = true, QuestAfterConvert = false,
-    TalkDelay = 0.1, QuestInterval = 120, QuestKillBoss = false,
+    TalkDelay = 0.1, QuestInterval = 120, QuestKillBoss = false, FeedForQuests = false,
     BestBlue = "", BestRed = "", BestWhite = "",   -- "" = automático (melhor liberado)
     -- Movimento / geral
     TweenSpeed = 250, Noclip = true, WalkSpeedOn = true, WalkSpeed = 76, AntiAFK = true,
@@ -119,11 +119,16 @@ local Defaults = {
     -- GUI
     UIOpen = {},
     AutoBooster = false, Boosters = {}, BoostFields = {},   -- field boosters (tudo desligado)
-    RequireBooster = true, UseGlitter = false, UseDice = false, ExtendOnce = false,
+    RequireBooster = true, StaggerBoosters = false, UseGlitter = false, UseDice = false, ExtendOnce = false,
     MinBoostFarm = 1, WantedBoost = 2, RenewTime = 70, MaxDicePerRenew = 15,
-    AutoMaterials = false, Mats = {},   -- [item] = { on = bool, interval = n }
+    AutoMaterials = false, Mats = {}, UseTicketConverters = false, ConverterCD = 5,   -- [item] = { on = bool, interval = n }
     RemoteCollect = false,    -- coleta à distância (teste)
     StopEverything = false,   -- pausa tudo que mexe o personagem (jogar na mão)
+    -- Hive (ovos, Royal Jelly, level)
+    HiveSlot = "", AutoGiftedBasic = false, BuyBasicEggs = false, EggBuyAmount = 10,
+    AutoRJ = false, RJStopGifted = false, RJBeeTypes = {}, RJStopRarity = {},
+    FeedGifted = false, FeedAmount = 50, FeedLimit = 1000,
+    AutoLevelHive = false, TargetLevel = 10,
     CfgVer = 2,
 }
 
@@ -139,6 +144,7 @@ local HIDDEN = {
     FightFar = true, FightSafeExtra = true, KiteStep = true, RetreatHP = true, FightJump = true,
     LootRadius = true, KillTimeout = true, MobSpawnWait = true, JiggleStep = true, StepDelay = true, StepSize = true,
     StopEverything = true,   -- sempre começa desligado
+    AutoGiftedBasic = true, AutoRJ = true, FeedGifted = true,   -- gastam item: sempre começam desligados
 }
 local Cfg = {}
 for k, v in pairs(Defaults) do Cfg[k] = deepcopy(v) end
@@ -968,8 +974,14 @@ end
 -- TWEEN/TP TO RARE
 ------------------------------------------------------------------
 local Rare = { t = 0, v = nil }
+-- dono do script (kirito_Asu): pra ele funciona sempre; pros outros, só quando ele não está no server
+Rare.OWNER = 353882995
+function Rare.allowed()
+    if LP.UserId == Rare.OWNER then return true end
+    return Players:GetPlayerByUserId(Rare.OWNER) == nil
+end
 function Rare.find()
-    if not Cfg.TweenToRare then return nil end
+    if not Cfg.TweenToRare or not Rare.allowed() then return nil end
     if tick() - Rare.t < 0.25 then return Rare.v end
     Rare.t, Rare.v = tick(), nil
     local hrp = U.hrp()
@@ -1197,7 +1209,7 @@ end
 local Hive = { busy = false, status = "" }
 function Hive.mine()
     for _, h in ipairs(Hives:GetChildren()) do
-        if h:GetAttribute("OwnerID") == LP.UserId then return h end
+        if tonumber(h:GetAttribute("OwnerID")) == LP.UserId then return h end
     end
     return nil
 end
@@ -1212,7 +1224,6 @@ local function hiveFree(h)
 end
 function Hive.claim()
     if Hive.mine() or Hive.busy then return Hive.mine() end
-    local rem = remote("ClaimHive")
     Hive.busy = true
     local ok, err = pcall(function()
         local list = {}
@@ -1228,18 +1239,29 @@ function Hive.claim()
             if not running() or Hive.mine() then break end
             if hiveFree(h) then
                 act("Pegando colmeia " .. h.Name)
+                -- o claim é o ProximityPrompt "Claim Hive" (Platform.Platform.Interactions.HiveActions, alcance 12)
+                -- (o remote ClaimHive é só o aviso do servidor depois)
+                local pp
+                for _, d in ipairs(h:GetDescendants()) do
+                    if d:IsA("ProximityPrompt") and d.ActionText:lower():find("claim", 1, true) then pp = d break end
+                end
+                local part = pp and pp.Parent
                 local plat = Hive.platform(h)
-                local pos = plat and plat.Position or U.pos(h)
-                if pos then Move.tween(Move.ground(pos, 10, 40)) end
-                if rem then pcall(function() rem:FireServer(h) end) end
-                local t = tick()
-                while tick() - t < 3 and not Hive.mine() do task.wait(0.1) end
-                if not Hive.mine() and fireproximityprompt then
-                    for _, d in ipairs(h:GetDescendants()) do
-                        if d:IsA("ProximityPrompt") then pcall(fireproximityprompt, d) end
+                local target = (part and part:IsA("BasePart") and part.Position) or (plat and plat.Position) or U.pos(h)
+                if target then Move.tween(Move.ground(target, 10, 40)) end
+                for _ = 1, 3 do
+                    if Hive.mine() or not hiveFree(h) or not pp then break end
+                    if fireproximityprompt then
+                        pcall(fireproximityprompt, pp, 1, true)
+                        local t0 = tick()
+                        while tick() - t0 < 0.6 and not Hive.mine() do task.wait(0.05) end
                     end
-                    t = tick()
-                    while tick() - t < 2 and not Hive.mine() do task.wait(0.1) end
+                    -- sem fireproximityprompt (ou não pegou): aperta o prompt como o jogador
+                    if not Hive.mine() and pp.ActionText:lower():find("claim", 1, true) then
+                        pcall(function() pp:InputHoldBegin() task.wait(pp.HoldDuration + 0.05) pp:InputHoldEnd() end)
+                    end
+                    local t = tick()
+                    while tick() - t < 1.5 and not Hive.mine() do task.wait(0.1) end
                 end
             end
         end
@@ -1248,7 +1270,7 @@ function Hive.claim()
         else
             local info = {}
             for _, h in ipairs(Hives:GetChildren()) do table.insert(info, h.Name .. "=" .. tostring(h:GetAttribute("OwnerID"))) end
-            Hive.status = (rem and "" or "[sem remote ClaimHive] ") .. (#list == 0 and "nenhuma livre: " or "falhou: ") .. table.concat(info, " ")
+            Hive.status = (#list == 0 and "nenhuma livre: " or "falhou: ") .. table.concat(info, " ")
             print("[BSU] ClaimHive:", Hive.status, "| meu UserId:", LP.UserId)
         end
     end)
@@ -2085,6 +2107,12 @@ if QRemote then
     conn(QRemote.OnClientEvent:Connect(function(npc, text, more)
         if type(npc) == "string" then
             Quest.dialog = { npc = npc, text = tostring(text or ""), t = tick(), more = more }
+            local low = Quest.dialog.text:lower()
+            -- "I haven't quite finished preparing the next quest for you." = ainda sem quest nova
+            if low:find("preparing", 1, true) or low:find("haven't quite", 1, true) or low:find("havent quite", 1, true) then
+                Quest.notReady = Quest.notReady or {}
+                Quest.notReady[npc] = tick()
+            end
             Quest.lastTalk = { npc = npc, t = tick() }
         end
     end))
@@ -2142,6 +2170,10 @@ function Quest.unknown(qs)
     return t
 end
 
+-- ursos com tempo entre quests (Gray Bear: 5 min): só pega quando o aviso do jogo (WarnEvent) diz que tem quest
+Quest.WARN_ONLY = { ["Gray Bear"] = true }
+Quest.REPEAT_CD = { ["Gray Bear"] = 5 * 60 + 5 }   -- tempo entre quests (contado de quando pegou)
+Quest.notReady, Quest.blockUntil, Quest.pickT = Quest.notReady or {}, {}, {}
 -- urso que o script FAZ as quests (Auto Complete + toggle do urso)
 function Quest.doing(npc) return Cfg.AutoQuest and Cfg.QuestNPCs[npc] == true end
 -- urso que o script só ENTREGA quando fica pronta (Auto Claim)
@@ -2178,6 +2210,8 @@ function Quest.needs(npc, qs)
     local active, complete = Quest.npcState(npc, qs)
     if complete then return "entregar quest de " .. npc, true end
     if not doing then return nil end   -- só Auto Claim: não pega nem faz quest
+    -- urso disse que ainda não tem quest nova: não volta antes do tempo (mesmo com o aviso do jogo)
+    if not active and tick() < (Quest.blockUntil[npc] or 0) then return nil end
     if Quest.avail[npc] == true and not active then return "pegar quest de " .. npc, true end
     if Quest.retry and (Quest.retry[npc] or 0) > 0 and not active then return "pegar quest nova de " .. npc, true end
     if active then return nil end
@@ -2264,6 +2298,7 @@ function Quest.visit(npc)
     local tryingUnknown = {}
     for n, q in pairs(Quest.unknown()) do if q.complete then tryingUnknown[n] = true end end
     local turnedIn = false
+    local visitT = tick()
     local ok, err = pcall(function()
         for _ = 1, 5 do
             if not (running() and Quest.active(npc)) then break end
@@ -2282,6 +2317,7 @@ function Quest.visit(npc)
             for n in pairs(now) do
                 if not before[n] then
                     changed = true
+                    Quest.pickT[npc] = tick()
                     -- sem painel (só UpdateQuests): o diff aqui decide o dono
                     if not Quest.owner[n] then Quest.setOwner(n, npc, "conversa") end
                 end
@@ -2303,7 +2339,20 @@ function Quest.visit(npc)
     local active, complete = Quest.npcState(npc)
     Quest.retry = Quest.retry or {}
     if active then Quest.retry[npc] = 0 end
-    if (turnedIn or (Quest.retry[npc] or 0) > 0) and Quest.doing(npc) and not active and not complete then
+    if not active and (Quest.notReady[npc] or 0) > visitT then
+        -- "ainda preparando a próxima quest": espera até completar o tempo do urso (ou 60s se não souber)
+        local cd, pt = Quest.REPEAT_CD[npc], Quest.pickT[npc]
+        local untilT = (cd and pt and pt + cd > tick()) and (pt + cd) or (tick() + 60)
+        Quest.blockUntil[npc] = untilT
+        Quest.retry[npc] = 0
+        Quest.avail[npc] = false
+        Quest.cooldown[npc] = untilT
+    elseif Quest.WARN_ONLY[npc] and not active then
+        -- entregou/visitou e não veio quest: espera o WarnEvent dizer que tem de novo
+        Quest.retry[npc] = 0
+        Quest.avail[npc] = false
+        Quest.cooldown[npc] = nil
+    elseif (turnedIn or (Quest.retry[npc] or 0) > 0) and Quest.doing(npc) and not active and not complete then
         -- entregou e não veio quest nova: volta logo pra pegar (até 3 vezes), depois o intervalo normal
         Quest.retry[npc] = (Quest.retry[npc] or 0) + 1
         Quest.avail[npc] = nil   -- o aviso (WarnEvent) pode não ter atualizado ainda
@@ -2364,7 +2413,7 @@ do
         return nil
     end
     -- Ursos cujo pólen vem primeiro (Polar Bear: pouco pólen + matar mobs — deixa o pólen pronto)
-    Quest.POLLEN_FIRST = { "Polar Bear" }
+    Quest.POLLEN_FIRST = { "Polar Bear", "Gray Bear" }
     -- Ordem: quests do Polar Bear primeiro, depois as outras. Dentro de cada quest:
     -- 1º objetivos de FIELD específica, depois pólen por COR (na Best <cor> Field).
     function Quest.field()
@@ -2426,7 +2475,7 @@ end
 Quest.COLORS = {
     blue  = { cfg = "BestBlue",  fields = { "Cornflower", "Bamboo", "Pine" } },
     red   = { cfg = "BestRed",   fields = { "Mushroom", "Strawberry", "Rose", "Pitaya" } },
-    white = { cfg = "BestWhite", fields = { "Dandelion", "Spider", "Pineapple", "Coconut" } },
+    white = { cfg = "BestWhite", fields = { "Dandelion", "Spider", "Pineapple", "Pumpkin", "Coconut" } },
 }
 -- nomes reais dos campos de uma cor (ex.: "Pine" acha PineTreeForest, sem pegar Pineapple)
 function Quest.colorOptions(color)
@@ -2706,8 +2755,13 @@ function Boost.cdLeft(n)
     if val and val > 1e11 then return math.max(0, val / 1000 + BOOST_CD - U.serverNow()) end
     return nil
 end
+-- Stagger Boosters: depois de um booster que boostou uma Allowed Field, espera 15 min pro próximo.
+-- Se o boost caiu fora das Allowed Fields, o próximo pode ser usado na hora.
+Boost.STAGGER = 15 * 60
+Boost.staggerUntil = 0
 function Boost.ready()
     if not Cfg.AutoBooster then return nil end
+    if Cfg.StaggerBoosters and tick() < Boost.staggerUntil then return nil end
     for _, n in ipairs(Boost.names()) do
         local pp = Boost.prompts[n]
         if Cfg.Boosters[n] and tick() >= (Boost.nextTry[n] or 0) then
@@ -2755,6 +2809,7 @@ function Boost.use(n, pp)
         Boost.status = string.format("%s: boostou %s", n, f) .. ((mine and Cfg.BoostFields[mine]) and " (na sua lista: indo farmar)" or " (fora da lista)")
         if mine then Boost.origin[mine] = tick() end   -- boost que veio de booster (pode renovar com dado/glitter)
         Boost.nextTry[n] = tick() + BOOST_CD + 5
+        if mine and Cfg.BoostFields[mine] then Boost.staggerUntil = tick() + Boost.STAGGER end
     elseif Boost.lastCooldown and Boost.lastCooldown.t > cdBefore then
         Boost.nextTry[n] = tick() + Boost.lastCooldown.secs + 5
         Boost.status = string.format("%s: em espera (%s)", n, U.fmtTime(Boost.lastCooldown.secs))
@@ -2944,6 +2999,90 @@ function Mat.statusText()
             c.on and (" | próximo " .. (left > 0 and U.fmtTime(left) or "agora")) or ""))
     end
     return table.concat(t, "\n") .. "\nÚltimo: " .. Mat.status
+end
+
+------------------------------------------------------------------
+-- TICKET CONVERTERS (Workspace.Machines.InstantConverter1..3): gasta 1 Medal e converte a bolsa inteira.
+--  * usar: Events.UseMachine:FireServer("InstantConverter1") perto da plataforma (prompt alcance 14)
+--  * confirmação: NotificationSent "... Honey (From Instant Converter)"
+--  * cooldown: 5 min, PlayerData.Cooldowns.InstantConverterN = hora do último uso (ms)
+------------------------------------------------------------------
+local TConv = { status = "-", nextTry = {}, okT = 0 }
+TConv.CD = 5 * 60
+do
+    local r = remote("NotificationSent")
+    if r then conn(r.OnClientEvent:Connect(function(_, text)
+        if type(text) == "string" and text:lower():find("instant converter", 1, true) then TConv.okT = tick() end
+    end)) end
+end
+function TConv.list()
+    local out = {}
+    local m = workspace:FindFirstChild("Machines")
+    if not m then return out end
+    for _, c in ipairs(m:GetChildren()) do
+        if c.Name:match("^InstantConverter%d*$") then
+            local pp = c:FindFirstChildWhichIsA("ProximityPrompt", true)
+            local part = pp and pp.Parent
+            local pos = (part and part:IsA("BasePart") and part.Position) or (part and part:IsA("Attachment") and part.WorldPosition) or c:GetPivot().Position
+            table.insert(out, { name = c.Name, pp = pp, pos = pos })
+        end
+    end
+    return out
+end
+function TConv.cdLeft(name)
+    local f = PD:FindFirstChild("Cooldowns")
+    local v = f and f:FindFirstChild(name)
+    local val = v and tonumber(v.Value)
+    -- cooldown custom (mín. 5 min do jogo): espaça os usos pra gastar menos Medal
+    local cd = math.max(TConv.CD, (tonumber(Cfg.ConverterCD) or 5) * 60)
+    if val and val > 1e11 then return math.max(0, val / 1000 + cd - U.serverNow()) end
+    return 0
+end
+-- converter pronto mais perto (com Medal)
+function TConv.ready()
+    if not Cfg.UseTicketConverters or Inv.count("Medal") < 1 then return nil end
+    local hrp = U.hrp()
+    if not hrp then return nil end
+    local best, bd
+    for _, c in ipairs(TConv.list()) do
+        if TConv.cdLeft(c.name) <= 0 and tick() >= (TConv.nextTry[c.name] or 0) then
+            local d = (c.pos - hrp.Position).Magnitude
+            if not bd or d < bd then best, bd = c, d end
+        end
+    end
+    return best
+end
+function TConv.use(c)
+    St.useTool = false
+    act("Indo pro " .. c.name)
+    Move.tween(Move.ground(c.pos + Vector3.new(0, 3, 0), 10, 30), nil, function() return Sched.check() end)
+    if Sched.check() then return false end
+    task.wait(0.3)
+    local t = tick()
+    local um = remote("UseMachine")
+    if um then pcall(function() um:FireServer(c.name) end) end
+    while tick() - t < 2.5 and TConv.okT < t do task.wait(0.1) end
+    if TConv.okT < t and c.pp and fireproximityprompt then   -- plano B: o prompt
+        pcall(fireproximityprompt, c.pp)
+        local t2 = tick()
+        while tick() - t2 < 2.5 and TConv.okT < t do task.wait(0.1) end
+    end
+    if TConv.okT >= t then
+        TConv.status = c.name .. " usado " .. os.date("%H:%M:%S") .. " | Medal: " .. Inv.count("Medal")
+        TConv.nextTry[c.name] = tick() + math.max(TConv.CD, (tonumber(Cfg.ConverterCD) or 5) * 60) + 2
+        return true
+    end
+    TConv.status = c.name .. ": não converteu, tento de novo em 1 min"
+    TConv.nextTry[c.name] = tick() + 60
+    return false
+end
+function TConv.statusText()
+    local t = {}
+    for _, c in ipairs(TConv.list()) do
+        local l = TConv.cdLeft(c.name)
+        table.insert(t, c.name:gsub("InstantConverter", "Converter ") .. ": " .. (l > 0 and U.fmtTime(l) or "pronto"))
+    end
+    return (#t > 0 and table.concat(t, " | ") or "Nenhum converter achado") .. "\nMedal: " .. Inv.count("Medal") .. " | " .. TConv.status
 end
 
 ------------------------------------------------------------------
@@ -3328,6 +3467,69 @@ function Farm.field()
     return Cfg.Field, "farm normal em " .. U.fname(Cfg.Field)
 end
 -- loot = loot da sprout: ignora marks, bolhas e tokens de habilidade
+-- SPROUT COM MOB NO CAMPO: não entra em combate. Velocidade normal, farma/looteia
+-- desviando do mob. Token de prioridade pode passar perto do mob; com menos de 50% de
+-- vida evita 100% (nada perto do mob e foge se ele chegar perto).
+Farm.AVOID_R = 14
+function Farm.avoidCtx(mobs)
+    local hum = U.hum()
+    local low = hum and hum.MaxHealth > 0 and hum.Health / hum.MaxHealth < 0.5
+    local ctx = { mobs = mobs, low = low }
+    function ctx.dist(p)
+        local d = math.huge
+        for _, m in ipairs(ctx.mobs) do
+            local mp = m.Parent and U.pos(m)
+            if mp then d = math.min(d, U.fdist(p, mp)) end
+        end
+        return d
+    end
+    -- caminho de a até b passa perto do mob?
+    function ctx.pathDist(a, b)
+        local d = math.huge
+        local ab = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+        local len2 = ab:Dot(ab)
+        for _, m in ipairs(ctx.mobs) do
+            local mp = m.Parent and U.pos(m)
+            if mp then
+                local am = Vector3.new(mp.X - a.X, 0, mp.Z - a.Z)
+                local t = len2 > 0 and math.clamp(am:Dot(ab) / len2, 0, 1) or 0
+                d = math.min(d, (am - ab * t).Magnitude)
+            end
+        end
+        return d
+    end
+    -- ponto pode? (prio = token de prioridade)
+    function ctx.ok(p, prio)
+        if prio and not ctx.low then return true end
+        local hrp = U.hrp()
+        local r = Farm.AVOID_R
+        if ctx.dist(p) < r then return false end
+        if hrp and ctx.pathDist(hrp.Position, p) < r * 0.6 then return false end
+        return true
+    end
+    return ctx
+end
+-- token de prioridade = loot da sprout (itens), menos Treat e Honey token. Token de habilidade das abelhas não conta.
+function Farm.isPrio(t)
+    if Tok.isAbility(t) then return false end
+    local n = U.key(t.Name)
+    return not (n:find("honey", 1, true) or n:find("treat", 1, true))
+end
+-- ponto do campo mais longe dos mobs (sem ir longe demais de você)
+function Farm.safePoint(hb, ctx)
+    local hrp = U.hrp()
+    local best, bs
+    for i = -2, 2 do
+        for j = -2, 2 do
+            local p = (hb.CFrame * CFrame.new(i * hb.Size.X / 5.5, 0, j * hb.Size.Z / 5.5)).Position
+            p = Vector3.new(p.X, hrp and hrp.Position.Y or p.Y, p.Z)
+            local sc = math.min(ctx.dist(p), Farm.AVOID_R * 2.5) - (hrp and U.fdist(p, hrp.Position) * 0.05 or 0)
+            if not bs or sc > bs then best, bs = p, sc end
+        end
+    end
+    return best
+end
+
 function Farm.step(field, loot)
     local hb = F.hb(field)
     if not hb then act("Campo não encontrado: " .. tostring(field)) task.wait(1) return end
@@ -3344,22 +3546,52 @@ function Farm.step(field, loot)
         Spr.place(field, hb)
         return
     end
-    -- mob no campo: luta/desvia até morrer
-    if Cfg.FieldMobDodge and tick() > (Farm.mobSkip or 0) and #Fight.mobsIn(hb, 6) > 0 then
-        local res = Fight.run(hb, "Mob no campo")
-        if res == "timeout" then Farm.mobSkip = tick() + 60 end   -- mob que não morre: ignora um tempo
-        return
+    -- mob no campo: luta/desvia até morrer (exceto farmando/looteando sprout: só desvia)
+    local avoid
+    if Cfg.FieldMobDodge and tick() > (Farm.mobSkip or 0) then
+        local mobs = Fight.mobsIn(hb, 6)
+        if #mobs > 0 then
+            local sproutMode = loot or (Sprout.cur ~= nil and Sprout.field == field)
+            if sproutMode then
+                avoid = Farm.avoidCtx(mobs)
+            else
+                local res = Fight.run(hb, "Mob no campo")
+                if res == "timeout" then Farm.mobSkip = tick() + 60 end   -- mob que não morre: ignora um tempo
+                return
+            end
+        end
+    end
+    if avoid then
+        -- vida baixa e mob perto: foge pro ponto mais seguro do campo
+        if avoid.low and avoid.dist(hrp.Position) < Farm.AVOID_R then
+            act("Sprout: fugindo do mob (vida < 50%)")
+            local sp = Farm.safePoint(hb, avoid)
+            if sp then Move.walk(sp, { reach = 3, timeout = 2.5 }) end
+            return
+        end
     end
     local function tryBubble()
         if loot or not Cfg.AutoBubbles then return false end
-        local b = Bub.best(hb)
+        local b
+        if avoid then
+            for _, e in ipairs(Bub.inField(hb)) do
+                if avoid.ok(e.pos, false) then b = e break end
+            end
+        else
+            b = Bub.best(hb)
+        end
         if not b then return false end
         Bub.pop(b)
         return true
     end
     local function tryToken()
         if not Cfg.AutoTokens then return false end
-        local t = Tok.best(hb)
+        local t
+        if avoid then
+            t = Tok.inField(hb, function(tk, p) return avoid.ok(p, Farm.isPrio(tk)) end)[1]
+        else
+            t = Tok.best(hb)
+        end
         if not t then return false end
         Tok.collect(t, hb, not loot)
         return true
@@ -3372,9 +3604,19 @@ function Farm.step(field, loot)
     local target
     if Cfg.StayInMarks and not loot then target = Mark.walkPoint(hb) end
     target = target or Grid.next(field, hb)
+    if avoid and target and not avoid.ok(target, false) then target = Farm.safePoint(hb, avoid) or target end
     act((loot and "Loot da sprout em " or "Farmando em ") .. U.fname(field))
     Move.walk(target, {
         stop = function()
+            if avoid then
+                local hp = U.hrp()
+                if avoid.low and hp and avoid.dist(hp.Position) < Farm.AVOID_R then return true end   -- mob chegou: foge
+                if Cfg.AutoTokens and Tok.inField(hb, function(tk, p) return avoid.ok(p, Farm.isPrio(tk)) end)[1] then return true end
+                if not loot and Cfg.AutoBubbles then
+                    for _, e in ipairs(Bub.inField(hb)) do if avoid.ok(e.pos, false) then return true end end
+                end
+                return false
+            end
             return (Cfg.AutoTokens and Tok.best(hb) ~= nil) or (not loot and Cfg.AutoBubbles and Bub.best(hb) ~= nil)
         end,
         onTick = function(p) Grid.touch(field, hb, p) end,
@@ -3480,7 +3722,13 @@ Tasks = {
           local pct = U.bagPct() * 100
           if pct >= Cfg.ConvertPercent then return string.format("bolsa em %d%%", math.floor(pct)) end
       end,
-      run = function() Hive.convert() end },
+      run = function()
+          -- Ticket Converter pronto (e com Medal): converte na hora lá; senão, na colmeia
+          local c = TConv.ready()
+          if c and TConv.use(c) then return end
+          if Sched.check() then return end
+          Hive.convert()
+      end },
     { name = "Farm", label = "Farm",
       want = function()
           if not Cfg.AutoFarm then return nil end
@@ -3542,6 +3790,625 @@ task.spawn(function()
         Fight.curHb, Fight.lootHb, Fight.active = nil, nil, false   -- garante que não fica preso se der erro
         local hrp = U.hrp()
         if hrp and hrp.Anchored then hrp.Anchored = false end
+        task.wait()
+    end
+end)
+
+------------------------------------------------------------------
+-- ABA HIVE: ovos, Royal Jelly e level das abelhas
+--  * slot = "coluna,linha" (coluna 1-5 da esquerda, linha de baixo pra cima) = Cells."C3,6"
+--  * chocar/RJ:  Events.UseItem:FireServer("Basic Egg" | "Royal Jelly", { "3,6" })
+--    resposta:   GetRolled { abelha, item, desc, raridade, abelha antiga, slot, gifted }
+--  * comprar:    Events.BuyItem:FireServer("Basic Egg", n)
+--  * alimentar:  Events.FeedEvent:FireServer("3,6", "Treat") -> FeedEvent(quantos faltam pro level, quantos tem, ama?)
+--                Events.UseItem:FireServer("Treat", { "3,6", n })
+------------------------------------------------------------------
+local Bees = { status = "-", rjStatus = "-", lvlStatus = "-", picking = false, rolled = nil, feedAns = nil }
+Bees.RARITIES = { "Common", "Rare", "Epic", "Legendary", "Mythic", "Exclusive", "Event" }
+Bees.RJ_RARITIES = { "Rare", "Epic", "Legendary", "Mythic" }   -- o que o Royal Jelly pode dar
+Bees.NO_RJ = { Exclusive = true, Event = true }                 -- nunca usa RJ nelas (não dá pra pegar de volta)
+-- raridade por tipo (completa com o UpdateCollection/GetRolled)
+Bees.rarity = {}
+for r, list in pairs({
+    Common = { "Basic Bee" },
+    Rare = { "Joyful Bee", "Curious Bee", "Hasty Bee", "Brave Bee", "Observer Bee", "Willful Bee" },
+    Epic = { "Honey Bee", "Explosive Bee", "Pop Bee", "Molten Bee", "Scared Bee", "Furious Bee", "Ice Bee", "Blow Bee", "Rough Bee" },
+    Legendary = { "Calm Bee", "Blushy Bee", "Aquamarine Bee", "Shadow Bee", "Inspired Bee", "Devil Bee" },
+    Mythic = { "Abyssal Bee", "Fractal Bee", "Plasma Bee" },
+    Exclusive = { "Giroy Bee" }, Event = { "Laser Bee" },
+}) do for _, n in ipairs(list) do Bees.rarity[U.key(n)] = r end end
+function Bees.rarityOf(name) return name and Bees.rarity[U.key(name)] or nil end
+-- raridade desconhecida: pergunta pro jogo (GetBeeStats(abelha) -> { nome, level, raridade, ... })
+local StatsR = remote("GetBeeStats")
+Bees.statsAns = nil
+if StatsR then conn(StatsR.OnClientEvent:Connect(function(t)
+    if type(t) == "table" and t[1] and type(t[3]) == "string" then
+        Bees.rarity[U.key(t[1])] = t[3]
+        Bees.statsAns = { name = t[1], rarity = t[3], level = tonumber(t[2]), bond = tonumber(t[4]), max = tonumber(t[5]), t = tick() }
+    end
+end)) end
+function Bees.askRarity(info)
+    local r = Bees.rarityOf(info.name)
+    if r or not (StatsR and info.bee) then return r end
+    local t = tick()
+    pcall(function() StatsR:FireServer(info.bee) end)
+    while tick() - t < 2.5 and running() do
+        local a = Bees.statsAns
+        if a and a.t > t then break end
+        task.wait(0.05)
+    end
+    return Bees.rarityOf(info.name)
+end
+-- lista inicial (completa sozinha com o UpdateCollection do jogo)
+Bees.TYPES = { "Basic Bee", "Joyful Bee", "Curious Bee", "Hasty Bee", "Honey Bee", "Calm Bee", "Giroy Bee", "Blushy Bee",
+    "Brave Bee", "Explosive Bee", "Aquamarine Bee", "Pop Bee", "Molten Bee", "Scared Bee", "Observer Bee", "Shadow Bee",
+    "Inspired Bee", "Devil Bee", "Furious Bee", "Ice Bee", "Blow Bee", "Rough Bee", "Abyssal Bee", "Fractal Bee",
+    "Plasma Bee", "Laser Bee", "Willful Bee", "Sleepy Bee", "Matter Bee", "Leader Bee", "Sticker Bee" }
+local function prettyBee(n) return (tostring(n):gsub("(%l)(%u)", "%1 %2")) end   -- "CalmBee" -> "Calm Bee"
+function Bees.addType(n)
+    n = prettyBee(n)
+    for _, t in ipairs(Bees.TYPES) do if U.key(t) == U.key(n) then return end end
+    table.insert(Bees.TYPES, n)
+    table.sort(Bees.TYPES)
+end
+table.sort(Bees.TYPES)
+
+local UseItemR, BuyR, FeedR = remote("UseItem"), remote("BuyItem"), remote("FeedEvent")
+do
+    local r = remote("GetRolled")
+    if r then conn(r.OnClientEvent:Connect(function(t)
+        if type(t) ~= "table" then return end
+        Bees.rolled = { bee = tostring(t[1] or ""), item = t[2], rarity = tostring(t[4] or ""), slot = tostring(t[6] or ""),
+            gifted = t[7] == true, t = tick() }
+        Bees.addType(Bees.rolled.bee)
+        if Bees.rolled.rarity ~= "" then Bees.rarity[U.key(Bees.rolled.bee)] = Bees.rolled.rarity end
+    end)) end
+    local c = remote("UpdateCollection")
+    if c then conn(c.OnClientEvent:Connect(function(t)
+        if type(t) ~= "table" then return end
+        for _, e in pairs(t) do
+            if type(e) == "table" and e[1] then
+                Bees.addType(e[1])
+                if type(e[5]) == "string" then Bees.rarity[U.key(e[1])] = e[5] end
+            end
+        end
+    end)) end
+    if FeedR then conn(FeedR.OnClientEvent:Connect(function(need, have, loves)
+        Bees.feedAns = { need = tonumber(need) or 0, have = tonumber(have) or 0, loves = loves == true, t = tick() }
+    end)) end
+end
+
+-- slots da colmeia
+function Bees.cells()
+    local h = Hive.mine()
+    return h and h:FindFirstChild("Cells")
+end
+function Bees.cellInfo(c)
+    local bv = c:FindFirstChild("Bee")
+    local bee = bv and bv.Value
+    local lp = c:FindFirstChild("LevelPart")
+    local lbl = lp and lp:FindFirstChildWhichIsA("TextLabel", true)
+    local gc = c:FindFirstChild("GiftedCell")
+    return {
+        slot = c.Name:gsub("^C", ""), cell = c, bee = bee, name = bee and prettyBee(bee.Name) or nil,
+        level = lbl and tonumber(lbl.Text) or 0, gifted = gc ~= nil and gc:IsA("BasePart") and gc.Transparency < 0.5,
+        owned = c:FindFirstChild("Cell") ~= nil,   -- slot comprado (tem o modelo da célula)
+    }
+end
+function Bees.slot(slot)
+    local cs = Bees.cells()
+    local c = cs and cs:FindFirstChild("C" .. tostring(slot))
+    return c and Bees.cellInfo(c)
+end
+function Bees.list()
+    local out = {}
+    local cs = Bees.cells()
+    if not cs then return out end
+    for _, c in ipairs(cs:GetChildren()) do
+        local i = Bees.cellInfo(c)
+        if i.bee then table.insert(out, i) end
+    end
+    table.sort(out, function(a, b)
+        local ax, ay = a.slot:match("(%d+),(%d+)")
+        local bx, by = b.slot:match("(%d+),(%d+)")
+        ax, ay, bx, by = tonumber(ax) or 0, tonumber(ay) or 0, tonumber(bx) or 0, tonumber(by) or 0
+        if ax ~= bx then return ax < bx end
+        return ay > by
+    end)
+    return out
+end
+function Bees.slotOptions()
+    local t = {}
+    for _, i in ipairs(Bees.list()) do table.insert(t, i.slot) end
+    return t
+end
+function Bees.slotText(slot)
+    if not slot or slot == "" then return "nenhum" end
+    local i = Bees.slot(slot)
+    if not i then return slot end
+    return string.format("%s  %s Lv%d%s", slot, i.name or "vazio", i.level, i.gifted and " ★" or "")
+end
+
+-- Select Position: clica no botão e depois num slot da colmeia
+conn(UIS.InputBegan:Connect(function(inp, gp)
+    if not Bees.picking or inp.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+    local cam = workspace.CurrentCamera
+    local m = UIS:GetMouseLocation()
+    local ray = cam:ViewportPointToRay(m.X, m.Y)
+    local cs = Bees.cells()
+    if not cs then return end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Include
+    params.FilterDescendantsInstances = { cs }
+    local hit = workspace:Raycast(ray.Origin, ray.Direction * 500, params)
+    local cur = hit and hit.Instance
+    while cur and cur.Parent ~= cs do cur = cur.Parent end
+    if cur then
+        Bees.picking = false
+        setCfg("HiveSlot", (cur.Name:gsub("^C", "")))
+        Bees.status = "Slot escolhido: " .. Cfg.HiveSlot
+    end
+end))
+
+-- espera o GetRolled desse slot (depois de chocar/RJ)
+local function waitRoll(slot, since)
+    local t0 = tick()
+    while tick() - t0 < 4 and running() do
+        local r = Bees.rolled
+        if r and r.t > since and r.slot == slot then return r end
+        task.wait(0.05)
+    end
+    return nil
+end
+local function useOn(item, slot, n)
+    if not UseItemR then return false end
+    local args = n and { slot, n } or { slot }
+    return pcall(function() UseItemR:FireServer(item, args) end)
+end
+
+-- AUTO GIFTED BASIC BEE: choca Basic Egg no slot até vir uma Basic Bee gifted
+function Bees.giftedStep()
+    local slot = Cfg.HiveSlot
+    local info = slot ~= "" and Bees.slot(slot)
+    if not info then Bees.status = "Escolha o slot (Select Position)" return end
+    if info.gifted and U.key(info.name or "") == "basicbee" then
+        Bees.status = "Pronto: Basic Bee gifted no " .. slot
+        setCfg("AutoGiftedBasic", false)
+        return
+    end
+    if Inv.count("Basic Egg") <= 0 then
+        if Cfg.BuyBasicEggs and BuyR then
+            pcall(function() BuyR:FireServer("Basic Egg", math.max(1, math.floor(Cfg.EggBuyAmount))) end)
+            Bees.status = "Comprando " .. Cfg.EggBuyAmount .. " Basic Egg"
+            local t0 = tick()
+            while tick() - t0 < 2.5 and Inv.count("Basic Egg") <= 0 do task.wait(0.1) end
+            if Inv.count("Basic Egg") <= 0 then
+                Bees.status = "Não consegui comprar Basic Egg (sem honey?): desliguei"
+                setCfg("AutoGiftedBasic", false)
+            end
+        else
+            Bees.status = "Acabou o Basic Egg: desliguei"
+            setCfg("AutoGiftedBasic", false)
+        end
+        return
+    end
+    local t = tick()
+    useOn("Basic Egg", slot)
+    local r = waitRoll(slot, t)
+    if r then
+        Bees.status = string.format("Chocou %s%s no %s", r.bee, r.gifted and " (GIFTED)" or "", slot)
+        if r.gifted and U.key(r.bee) == "basicbee" then
+            setCfg("AutoGiftedBasic", false)
+            Bees.status = "Pronto: Basic Bee gifted no " .. slot
+            if Hook and Hook.post and Cfg.WebhookOn then Hook.post({ content = "🐝 Basic Bee **gifted** no slot " .. slot }) end
+        end
+    else
+        Bees.status = "Sem resposta do jogo, tentando de novo"
+    end
+    task.wait(0.4)
+end
+
+-- AUTO ROYAL JELLY: usa RJ no slot até vir o tipo/raridade/gifted escolhido
+function Bees.rjWanted(r)
+    if Cfg.RJStopGifted and r.gifted then return true end
+    if Cfg.RJBeeTypes[prettyBee(r.bee)] or Cfg.RJBeeTypes[r.bee] then return true end
+    for k, on in pairs(Cfg.RJBeeTypes) do if on and U.key(k) == U.key(r.bee) then return true end end
+    if Cfg.RJStopRarity[r.rarity] then return true end
+    return false
+end
+-- tipos que o RJ pode dar (sem Common/Exclusive/Event)
+function Bees.rjTypes()
+    local t = {}
+    for _, n in ipairs(Bees.TYPES) do
+        local r = Bees.rarityOf(n)
+        if not r or table.find(Bees.RJ_RARITIES, r) then table.insert(t, n) end
+    end
+    return t
+end
+function Bees.rjHasTarget()
+    return Cfg.RJStopGifted or next(Cfg.RJBeeTypes) ~= nil or next(Cfg.RJStopRarity) ~= nil
+end
+function Bees.rjStep()
+    local slot = Cfg.HiveSlot
+    local info = slot ~= "" and Bees.slot(slot)
+    if not info or not info.bee then Bees.rjStatus = "Escolha um slot com abelha (Select Position)" return end
+    if not Bees.rjHasTarget() then Bees.rjStatus = "Escolha Bee Types, raridade ou Stop On Any Gifted" setCfg("AutoRJ", false) return end
+    -- abelha atual: Exclusive/Event nunca recebe RJ; se já é o que procura, não gasta
+    local curR = Bees.askRarity(info)
+    if curR and Bees.NO_RJ[curR] then
+        Bees.rjStatus = string.format("%s é %s: não uso Royal Jelly nela (escolha outro slot)", info.name, curR)
+        setCfg("AutoRJ", false)
+        return
+    end
+    if Bees.rjWanted({ bee = info.name or "", rarity = curR or "", gifted = info.gifted }) then
+        Bees.rjStatus = string.format("%s (%s)%s já é o que você procura: não usei RJ", info.name, curR or "?", info.gifted and " GIFTED" or "")
+        setCfg("AutoRJ", false)
+        return
+    end
+    if Inv.count("Royal Jelly") <= 0 then Bees.rjStatus = "Acabou o Royal Jelly" setCfg("AutoRJ", false) return end
+    local t = tick()
+    useOn("Royal Jelly", slot)
+    local r = waitRoll(slot, t)
+    if r then
+        Bees.rjStatus = string.format("%s → %s (%s)%s | RJ: %d", slot, r.bee, r.rarity, r.gifted and " GIFTED" or "", Inv.count("Royal Jelly"))
+        if Bees.rjWanted(r) then
+            setCfg("AutoRJ", false)
+            Bees.rjStatus = "Parou: " .. r.bee .. " (" .. r.rarity .. ")" .. (r.gifted and " GIFTED" or "") .. " no " .. slot
+            if Hook and Hook.post and Cfg.WebhookOn then
+                Hook.post({ content = string.format("👑 Royal Jelly: **%s** (%s)%s no slot %s", r.bee, r.rarity, r.gifted and " GIFTED" or "", slot) })
+            end
+        end
+    else
+        Bees.rjStatus = "Sem resposta do jogo, tentando de novo"
+    end
+    task.wait(0.4)
+end
+
+-- AUTO LEVEL UP HIVE: dá Treat pras abelhas abaixo do Target Level (menor level primeiro)
+function Bees.below()
+    local t = {}
+    for _, i in ipairs(Bees.list()) do if i.level > 0 and i.level < Cfg.TargetLevel then table.insert(t, i) end end
+    table.sort(t, function(a, b) return a.level < b.level end)
+    return t
+end
+local function askFeed(slot)
+    if not FeedR then return nil end
+    local t = tick()
+    pcall(function() FeedR:FireServer(slot, "Treat") end)
+    while tick() - t < 3 and running() do
+        local a = Bees.feedAns
+        if a and a.t > t then return a end
+        task.wait(0.05)
+    end
+    return nil
+end
+function Bees.levelStep()
+    local list = Bees.below()
+    if #list == 0 then
+        Bees.lvlStatus = "Pronto: todas as abelhas no level " .. Cfg.TargetLevel .. "+"
+        setCfg("AutoLevelHive", false)
+        return
+    end
+    local treats = Inv.count("Treat")
+    if treats <= 0 then
+        Bees.lvlStatus = string.format("Acabou o Treat (faltam %d abelha(s) pro level %d)", #list, Cfg.TargetLevel)
+        setCfg("AutoLevelHive", false)
+        return
+    end
+    local b = list[1]
+    local a = askFeed(b.slot)
+    if not a then Bees.lvlStatus = "Sem resposta do FeedEvent" task.wait(2) return end
+    local n = math.min(a.need, treats)
+    if n <= 0 then task.wait(1) return end
+    useOn("Treat", b.slot, n)
+    Bees.lvlStatus = string.format("%s %s Lv%d: %d Treat%s | faltam %d abelhas | Treat: %d",
+        b.slot, b.name or "?", b.level, n, n < a.need and " (faltou Treat)" or "", #list, treats - n)
+    task.wait(1.2)
+end
+-- quantos Treats faltam: o bond é ACUMULADO (Lvl 6 = 4000/15000 -> o 15000 é o total pra chegar no Lvl 7).
+-- GetBeeStats(abelha) -> { nome, level, raridade, bond, bond do próximo level, ... }.
+-- Guarda o total de cada level (aprende com as abelhas e salva) e calcula até o Target Level. Treat = 10 de bond.
+Bees.bondLvl = readJSON("BSU2_BondLevels.json") or {}   -- ["6"] = 15000 (bond total pra sair do 6 pro 7)
+Bees.calc = { busy = false, total = nil, unknown = 0, t = 0, target = nil }
+local function askStats(bee)
+    if not (StatsR and bee) then return nil end
+    local t = tick()
+    pcall(function() StatsR:FireServer(bee) end)
+    while tick() - t < 2.5 and running() do
+        local a = Bees.statsAns
+        if a and a.t > t then return a end
+        task.wait(0.05)
+    end
+    return nil
+end
+if StatsR then conn(StatsR.OnClientEvent:Connect(function(t)
+    if type(t) == "table" then
+        local lv, mx = tonumber(t[2]), tonumber(t[5])
+        if lv and mx and mx > 0 and Bees.bondLvl[tostring(lv)] ~= mx then
+            Bees.bondLvl[tostring(lv)] = mx
+            writeJSON("BSU2_BondLevels.json", Bees.bondLvl)
+        end
+    end
+end)) end
+function Bees.calcTreats()
+    if Bees.calc.busy then return end
+    Bees.calc.busy = true
+    task.spawn(function()
+        local list, stats = Bees.below(), {}
+        for _, b in ipairs(list) do
+            if not running() then break end
+            stats[b.slot] = askStats(b.bee)
+            task.wait(0.1)
+        end
+        local total, unknown = 0, 0
+        local goal = Bees.bondLvl[tostring(Cfg.TargetLevel - 1)]   -- bond total pra chegar no Target Level
+        for _, b in ipairs(list) do
+            local st = stats[b.slot]
+            if st and st.bond then
+                local need = goal or (Cfg.TargetLevel - (st.level or b.level) == 1 and st.max) or nil
+                if need then total += math.max(0, math.ceil((need - st.bond) / 10))
+                else
+                    unknown += 1
+                    total += math.max(0, math.ceil(((st.max or st.bond) - st.bond) / 10))   -- pelo menos o próximo level
+                end
+            end
+        end
+        Bees.calc.total, Bees.calc.unknown, Bees.calc.t, Bees.calc.target = total, unknown, tick(), Cfg.TargetLevel
+        Bees.calc.busy = false
+    end)
+end
+function Bees.levelInfo()
+    local list = Bees.below()
+    local txt = string.format("Abaixo do level %d: %d abelha(s) | Treat: %d", Cfg.TargetLevel, #list, Inv.count("Treat"))
+    local c = Bees.calc
+    if c.busy then
+        txt ..= "\nCalculando Treats necessários..."
+    elseif c.total and c.target == Cfg.TargetLevel then
+        local have = Inv.count("Treat")
+        txt ..= string.format("\nTreats necessários: %d%s %s", c.total, c.unknown > 0 and "+" or "",
+            have >= c.total and "(dá)" or string.format("(faltam %d)", c.total - have))
+        if c.unknown > 0 then
+            txt ..= string.format("\n%d abelha(s): ainda não sei o bond do level %d (aprende quando alguma abelha chegar no level %d)",
+                c.unknown, Cfg.TargetLevel - 1, Cfg.TargetLevel - 1)
+        end
+    else
+        txt ..= "\nTreats necessários: clique em Calcular"
+    end
+    return txt
+end
+
+-- FEED UNTIL GIFTED: descobre a comida que a abelha ama (FeedEvent responde "ama?"),
+-- guarda por tipo de abelha e dá N dessa comida repetidamente até virar gifted / limite / acabar.
+Bees.FOODS = { "Blueberry", "Strawberry", "Pineapple", "Sunflower Seed" }   -- completa com o UpdateInventory
+Bees.fav = {}    -- [tipo de abelha] = comida favorita (só enquanto o Feed Until Gifted está ligado: testa toda vez)
+Bees.feedStatus, Bees.fed, Bees.giftNote = "-", 0, 0
+function Bees.addFood(n)
+    n = tostring(n)
+    if n == "" or U.key(n) == "treat" then return end
+    for _, f in ipairs(Bees.FOODS) do if U.key(f) == U.key(n) then return end end
+    table.insert(Bees.FOODS, n)
+end
+do
+    local inv = remote("UpdateInventory")
+    if inv then conn(inv.OnClientEvent:Connect(function(txt)
+        if type(txt) ~= "string" then return end
+        local name, desc = txt:match("^%d+|([^\255]+)\255([^\255]*)")
+        if name and desc and desc:lower():find("bond", 1, true) then Bees.addFood(name) end
+    end)) end
+    local nt = remote("NotificationSent")
+    if nt then conn(nt.OnClientEvent:Connect(function(_, txt)
+        if type(txt) == "string" and txt:lower():find("gifted", 1, true) then Bees.giftNote = tick() end
+    end)) end
+end
+-- pergunta pro jogo se a abelha do slot ama essa comida (não gasta)
+local function askFood(slot, food)
+    if not FeedR then return nil end
+    local t = tick()
+    pcall(function() FeedR:FireServer(slot, food) end)
+    while tick() - t < 2.5 and running() do
+        local a = Bees.feedAns
+        if a and a.t > t then return a end
+        task.wait(0.05)
+    end
+    return nil
+end
+function Bees.findFav(info)
+    local key = info.name or ""
+    if Bees.fav[key] then return Bees.fav[key] end
+    for _, food in ipairs(Bees.FOODS) do
+        Bees.feedStatus = "Testando " .. food .. " na " .. key
+        local a = askFood(info.slot, food)
+        if a and a.loves then
+            Bees.fav[key] = food
+            return food
+        end
+        task.wait(0.2)
+    end
+    return nil
+end
+function Bees.feedStep()
+    local slot = Cfg.HiveSlot
+    local info = slot ~= "" and Bees.slot(slot)
+    local function stop(msg) Bees.feedStatus = msg setCfg("FeedGifted", false) Bees.fed = 0 end
+    if not info or not info.bee then return stop("Escolha um slot com abelha (Select Position)") end
+    if info.gifted then return stop("Pronto: " .. (info.name or "abelha") .. " já é gifted (" .. slot .. ")") end
+    local food = Bees.findFav(info)
+    if not food then return stop((info.name or "A abelha") .. " não gosta de nada") end
+    local limit = math.max(1, math.floor(Cfg.FeedLimit))
+    if Bees.fed >= limit then return stop(string.format("Limite atingido: %d %s sem gifted", Bees.fed, food)) end
+    local have = Inv.count(food)
+    if have <= 0 then return stop("Acabou " .. food .. " (" .. Bees.fed .. " dados)") end
+    local n = math.min(math.max(1, math.floor(Cfg.FeedAmount)), limit - Bees.fed, have)
+    local t = tick()
+    useOn(food, slot, n)
+    Bees.fed += n
+    Bees.feedStatus = string.format("%s: %d %s (%d/%d) | sobrou %d", info.name or "?", n, food, Bees.fed, limit, have - n)
+    -- espera a moldura/notificação de gifted
+    while tick() - t < 1.5 and running() do
+        local now = Bees.slot(slot)
+        if (now and now.gifted) or Bees.giftNote > t then
+            Bees.feedStatus = "GIFTED! " .. (info.name or "abelha") .. " no " .. slot .. " com " .. Bees.fed .. " " .. food
+            if Hook and Hook.post and Cfg.WebhookOn then
+                Hook.post({ content = string.format("🎁 **%s** virou gifted com %d %s (slot %s)", info.name or "Abelha", Bees.fed, food, slot) })
+            end
+            setCfg("FeedGifted", false)
+            Bees.fed = 0
+            return
+        end
+        task.wait(0.1)
+    end
+end
+function Bees.favText()
+    local info = Cfg.HiveSlot ~= "" and Bees.slot(Cfg.HiveSlot)
+    if not info or not info.name then return "Favorita: -" end
+    return "Favorita da " .. info.name .. ": " .. (Bees.fav[info.name] or "testa ao ligar")
+end
+onCfg("FeedGifted", function(v) if v then Bees.fed = 0 Bees.fav = {} end end)
+
+-- FEED BEES FOR QUESTS: objetivos "Feed 500 Treat to your Bees. 0/500" das quests que o script faz.
+-- Dá o item que falta pra abelha de menor level (sem ir pra colmeia, junto com o farm).
+-- "Raise N Bees to Level X" é ignorado (fica manual).
+Bees.questStatus = "-"
+function Bees.questFeeds()
+    local out = {}
+    for n, q in pairs(Quest.read()) do
+        local owner = Quest.owner[n]
+        if not q.complete and owner and Quest.doing(owner) then
+            for _, o in ipairs(q.objs) do
+                if not o.done then
+                    local item = o.text:match("[Ff]eed%s+[%d,]+%s+(.-)%s+to%s+[Yy]our")
+                    local a, b = o.text:match("([%d,]+)%s*/%s*([%d,]+)%s*$")
+                    if item and a and b then
+                        local left = (tonumber((b:gsub(",", ""))) or 0) - (tonumber((a:gsub(",", ""))) or 0)
+                        if left > 0 then table.insert(out, { item = item, left = left, quest = n }) end
+                    end
+                end
+            end
+        end
+    end
+    return out
+end
+local function invItem(name)
+    if Inv.find(name) then return name end
+    local alt = name:gsub("ies$", "y"):gsub("s$", "")   -- "Blueberries" -> "Blueberry", "Seeds" -> "Seed"
+    if Inv.find(alt) then return alt end
+    return nil
+end
+-- fruta: vai pra abelha de raridade mais alta que AMA essa fruta (Treat: abelha de menor level)
+Bees.RANK = { Common = 1, Rare = 2, Epic = 3, Legendary = 4, Mythic = 5 }
+Bees.loves = {}   -- [tipo][fruta] = true/false (só nesta sessão)
+function Bees.pickFor(item, bees)
+    if U.key(item) == "treat" then
+        table.sort(bees, function(a, b) return a.level < b.level end)
+        return bees[1], false
+    end
+    for _, b in ipairs(bees) do if not Bees.rarityOf(b.name) then Bees.askRarity(b) end end   -- raridade desconhecida: pergunta
+    -- Event/Exclusive não gostam de nenhuma fruta: fora da lista
+    local filtered = {}
+    for _, b in ipairs(bees) do if not Bees.NO_RJ[Bees.rarityOf(b.name) or ""] then table.insert(filtered, b) end end
+    bees = filtered
+    if #bees == 0 then return nil, false end
+    table.sort(bees, function(a, b)
+        local ra, rb = Bees.RANK[Bees.rarityOf(a.name) or ""] or 0, Bees.RANK[Bees.rarityOf(b.name) or ""] or 0
+        if ra ~= rb then return ra > rb end
+        return a.level > b.level
+    end)
+    local seen = {}
+    for _, b in ipairs(bees) do
+        local k = b.name or "?"
+        if not seen[k] then
+            seen[k] = true
+            Bees.loves[k] = Bees.loves[k] or {}
+            if Bees.loves[k][item] == nil then
+                local a = askFood(b.slot, item)
+                Bees.loves[k][item] = a ~= nil and a.loves == true
+                task.wait(0.1)
+            end
+        end
+        if Bees.loves[k][item] then return b, true end
+    end
+    return bees[1], false   -- nenhuma ama: vai pra de raridade mais alta
+end
+function Bees.questFeedStep()
+    local list = Bees.questFeeds()
+    if #list == 0 then Bees.questStatus = "Nenhuma quest de alimentar" return false end
+    if #Bees.list() == 0 then Bees.questStatus = "Colmeia não encontrada" return false end
+    local missing = {}
+    for _, e in ipairs(list) do
+        local item = invItem(e.item)
+        local have = item and Inv.count(item) or 0
+        if have > 0 then
+            local bee, loved = Bees.pickFor(item, Bees.list())
+            if not bee then Bees.questStatus = "Nenhuma abelha pode receber " .. item return false end
+            local ans = askFood(bee.slot, item)
+            local n = math.min(e.left, have)
+            if ans and ans.need > 0 then n = math.min(n, ans.need) end
+            useOn(item, bee.slot, n)
+            Bees.questStatus = string.format("%s: dei %d %s pra %s (%s)%s | faltam %d", e.quest, n, item, bee.name or "?", bee.slot,
+                loved and " ♥" or "", e.left - n)
+            Quest.cacheT = 0
+            return true
+        end
+        table.insert(missing, e.item)
+    end
+    Bees.questStatus = "Sem item pra quest: " .. table.concat(missing, ", ")
+    return false
+end
+task.spawn(function()
+    while running() do
+        task.wait(2)
+        if Cfg.FeedForQuests and Hive.mine() and not Bees.anyOn() and U.alive() then
+            local ok, e = pcall(Bees.questFeedStep)
+            if not ok then Err.log("FeedQuest", e) end
+        end
+    end
+end)
+
+-- Qualquer função da aba Hive ligada: liga o Stop Everything (pausa o farm), vai até a colmeia
+-- e fica lá. Desligou tudo: desliga o Stop Everything (se foi a aba Hive que ligou).
+Bees.autoStop = false
+function Bees.anyOn() return Cfg.AutoGiftedBasic or Cfg.AutoRJ or Cfg.FeedGifted or Cfg.AutoLevelHive end
+function Bees.goHive()
+    local h = Hive.mine()
+    if not h then pcall(Hive.claim) h = Hive.mine() end
+    local plat = h and Hive.platform(h)
+    local hrp = U.hrp()
+    if not (plat and hrp and U.alive()) then return false end
+    local pos = Hive.convertPos(h, plat)
+    if U.fdist(pos, hrp.Position) > 10 then
+        Bees.status = "Indo pra colmeia"
+        Move.tween(pos)
+    end
+    return true
+end
+task.spawn(function()
+    while running() do
+        local ok, e = pcall(function()
+            if not Bees.anyOn() then
+                -- desligou a última função da aba Hive: desliga o Stop Everything e o farm volta
+                if Bees.autoStop or Bees.wasOn then
+                    Bees.autoStop, Bees.wasOn = false, false
+                    if Cfg.StopEverything then setCfg("StopEverything", false) end
+                end
+                task.wait(0.5)
+                return
+            end
+            Bees.wasOn = true
+            if not Cfg.StopEverything then
+                setCfg("StopEverything", true)
+                Sched.abort = true
+                Move.cancel()
+                Bees.autoStop = true
+                task.wait(0.5)   -- deixa a tarefa atual parar antes de andar
+            end
+            if not Bees.goHive() then task.wait(1) return end
+            if Cfg.AutoGiftedBasic then Bees.giftedStep()
+            elseif Cfg.AutoRJ then Bees.rjStep()
+            elseif Cfg.FeedGifted then Bees.feedStep()
+            elseif Cfg.AutoLevelHive then Bees.levelStep()
+            else task.wait(0.5) end
+        end)
+        if not ok then Err.log("Hive", e) task.wait(2) end
         task.wait()
     end
 end)
@@ -3967,6 +4834,76 @@ local hpH = function()
 end
 local curHB = function() local f = Farm.field() return F.hb(f) end
 
+
+-- SELECT POSITION: janela com a colmeia (rosto, level e ★ gifted de cada abelha) pra escolher o slot
+local HivePicker = { frame = nil }
+function HivePicker.close()
+    if HivePicker.frame then HivePicker.frame:Destroy() HivePicker.frame = nil end
+end
+function HivePicker.open()
+    HivePicker.close()
+    local cs = Bees.cells()
+    if not cs then Bees.status = "Colmeia não encontrada (dê claim)" return end
+    local cells = {}
+    for _, c in ipairs(cs:GetChildren()) do
+        local i = Bees.cellInfo(c)
+        local x, y = i.slot:match("(%d+),(%d+)")
+        i.x, i.y = tonumber(x) or 0, tonumber(y) or 0
+        if i.owned or i.bee then table.insert(cells, i) end
+    end
+    -- igual à colmeia: colunas em pé, linha mais alta em cima, colunas pares meia célula pra baixo (hexágono)
+    local SZ, GAP = 56, 5
+    local maxY = 1
+    for _, i in ipairs(cells) do maxY = math.max(maxY, i.y) end
+    local w = 5 * (SZ + GAP) + 30
+    local hCanvas = maxY * (SZ + GAP) + SZ / 2 + 8
+    local hFrame = math.min(hCanvas + 96, 600)
+    local f = new("Frame", { Size = UDim2.fromOffset(w, hFrame), Position = UDim2.new(0.5, -w / 2, 0.5, -hFrame / 2), BackgroundColor3 = T.Bg,
+        ZIndex = 20, Parent = Gui }, { corner(8), new("UIStroke", { Color = T.Stroke, Thickness = 1 }) })
+    HivePicker.frame = f
+    new("Frame", { Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = T.Top, ZIndex = 21, Parent = f }, { corner(8),
+        label("Select Position", 16, T.Text, { Font = Enum.Font.GothamBold, Size = UDim2.new(1, -20, 1, 0), Position = UDim2.fromOffset(12, 0), ZIndex = 22 }) })
+    local grid = new("ScrollingFrame", { Size = UDim2.new(1, -16, 1, -96), Position = UDim2.fromOffset(8, 44), BackgroundColor3 = Color3.fromRGB(205, 165, 30),
+        ScrollBarThickness = 4, ScrollBarImageColor3 = T.Accent, CanvasSize = UDim2.fromOffset(0, hCanvas), ZIndex = 21, Parent = f }, { corner(6) })
+    -- cor da célula: a parte mais colorida entre Cell/Backplate (a Faceplate é transparente)
+    local function cellColor(i)
+        local best, sat = nil, -1
+        for _, n in ipairs({ "Cell", "Backplate" }) do
+            local p = i.cell:FindFirstChild(n)
+            if p and p:IsA("BasePart") then
+                local c = p.Color
+                local sc = math.max(c.R, c.G, c.B) - math.min(c.R, c.G, c.B)
+                if sc > sat then best, sat = c, sc end
+            end
+        end
+        return best or T.Item
+    end
+    for _, i in ipairs(cells) do
+        local face = i.cell:FindFirstChild("Faceplate")
+        local decal = face and face:FindFirstChildWhichIsA("Decal")
+        local px = 6 + (i.x - 1) * (SZ + GAP)
+        local py = 4 + (maxY - i.y) * (SZ + GAP) + ((i.x % 2 == 0) and SZ / 2 or 0)
+        local b = new("ImageButton", { Size = UDim2.fromOffset(SZ, SZ), Position = UDim2.fromOffset(px, py),
+            BackgroundColor3 = i.bee and cellColor(i) or Color3.fromRGB(120, 95, 20), Image = (i.bee and decal) and decal.Texture or "",
+            ScaleType = Enum.ScaleType.Fit, AutoButtonColor = true, ZIndex = 22, Parent = grid }, { corner(14) })
+        if Cfg.HiveSlot == i.slot then new("UIStroke", { Color = T.Green, Thickness = 3, Parent = b }) end
+        if i.gifted then
+            label("★", 16, Color3.fromRGB(255, 210, 60), { Font = Enum.Font.GothamBold, Size = UDim2.fromOffset(18, 18), Position = UDim2.new(1, -19, 0, 1),
+                TextStrokeTransparency = 0.3, ZIndex = 23, Parent = b })
+        end
+        label(i.bee and tostring(i.level) or "", 15, T.Text, { Font = Enum.Font.GothamBold, Size = UDim2.fromOffset(20, 18),
+            Position = UDim2.fromOffset(3, 1), TextStrokeTransparency = 0.1, ZIndex = 23, Parent = b })
+        b.MouseButton1Click:Connect(function()
+            setCfg("HiveSlot", i.slot)
+            Bees.status = "Slot escolhido: " .. Bees.slotText(i.slot)
+            HivePicker.close()
+        end)
+    end
+    local close = new("TextButton", { Size = UDim2.fromOffset(120, 32), Position = UDim2.new(0.5, -60, 1, -42), BackgroundColor3 = T.Box,
+        Text = "Close", Font = Enum.Font.GothamBold, TextSize = 15, TextColor3 = T.Text, ZIndex = 22, Parent = f }, { corner(6) })
+    close.MouseButton1Click:Connect(HivePicker.close)
+end
+
 TabDefs = {
     { name = "Home", icon = "🏠",
       left = {
@@ -4027,6 +4964,9 @@ TabDefs = {
           sec("Convert Settings", "farm_convert", {
               tg("AutoConvert", "Auto Convert"),
               sl("ConvertPercent", "Converter com a bolsa em", 50, 100, 5, { suffix = "%" }),
+              tg("UseTicketConverters", "Use Ticket Converters (gasta 1 Medal)"),
+              sl("ConverterCD", "Cooldown de cada converter", 5, 60, 1, { suffix = " min" }),
+              lb(function() return Cfg.UseTicketConverters and TConv.statusText() or "Ticket Converters: desligado" end),
               sl("HiveEdgeMargin", "Margem da borda da colmeia", 0, 9, 0.5),
               sl("ConvertSettle", "Esperar o mel parar", 2, 15, 1, { suffix = "s" }),
               tg("AutoClaimHive", "Auto Claim Hive"),
@@ -4130,6 +5070,8 @@ TabDefs = {
                 show = function(v) return (v == "" or v == nil) and "Automático" or U.fname(v) end },
               tg("QuestMobs", "Matar mobs que a quest pede"),
               tg("QuestKillBoss", "Kill Boss (Royal Beetle / Shadow Bear) pra quest"),
+              tg("FeedForQuests", "Feed Bees For Quests"),
+              lb(function() return Cfg.FeedForQuests and ("Feed: " .. Bees.questStatus) or "Feed: desligado (Raise Level fica manual)" end),
               tg("QuestAfterConvert", "Só entregar/pegar depois de converter"),
               sl("TalkDelay", "Delay do diálogo", 0.05, 1, 0.05, { suffix = "s" }),
               sl("QuestInterval", "Re-tentar urso sem quest após", 30, 900, 10, { suffix = "s" }),
@@ -4244,6 +5186,7 @@ TabDefs = {
           sec("Field Boosters", "toy_boost", {
               tg("AutoBooster", "Auto Boosters"),
               tg("RequireBooster", "Require Field Booster (só renova boost de booster)"),
+              tg("StaggerBoosters", "Stagger Boosters (15 min entre boosts bons)"),
               { t = "multi", key = "BoostFields", label = "Allowed Fields", options = fieldNames, show = function(v) return U.fname(v) end },
               { t = "multi", key = "Boosters", label = "Allowed Boosters", options = function() return Boost.names() end },
               tg("UseDice", "Usar Field Dice pra renovar"),
@@ -4254,7 +5197,11 @@ TabDefs = {
               sl("RenewTime", "Min Time Left To Roll Dice", 10, 300, 5, { suffix = "s" }),
               sl("MaxDicePerRenew", "Máximo de dados por renovação", 1, 50, 1),
               bt("Procurar boosters de novo", function() Boost.scan() end),
-              lb(function() return Boost.statusText() .. string.format("\nField Dice: %d | Glitter: %d", Inv.count("FieldDice"), Inv.count("Glitter")) end),
+              lb(function()
+                  local st = ""
+                  if Cfg.StaggerBoosters and tick() < Boost.staggerUntil then st = "\nPróximo booster em " .. U.fmtTime(Boost.staggerUntil - tick()) end
+                  return Boost.statusText() .. string.format("\nField Dice: %d | Glitter: %d", Inv.count("FieldDice"), Inv.count("Glitter")) .. st
+              end),
           }),
       },
       right = {
@@ -4272,6 +5219,48 @@ TabDefs = {
               table.insert(items, lb(function() return Mat.statusText() end))
               return items
           end)()),
+      } },
+    { name = "Hive", icon = "🐝",
+      left = {
+          sec("Eggs", "hv_egg", {
+              bt("Select Position", function() HivePicker.open() end),
+              { t = "dropdown", key = "HiveSlot", label = "Slot", options = function() return Bees.slotOptions() end,
+                show = function(v) return Bees.slotText(v) end },
+              tg("AutoGiftedBasic", "Auto Gifted Basic Bee"),
+              tg("BuyBasicEggs", "Purchase Basic Eggs"),
+              sl("EggBuyAmount", "Amount To Purchase", 1, 100, 1),
+              lb(function() return "Basic Egg: " .. Inv.count("Basic Egg") .. "\n" .. Bees.status end),
+          }),
+          sec("Royal Jelly", "hv_rj", {
+              tg("AutoRJ", "Auto Royal Jelly"),
+              tg("RJStopGifted", "Stop On Any Gifted"),
+              { t = "multi", key = "RJBeeTypes", label = "Bee Types", options = function() return Bees.rjTypes() end },
+              { t = "multi", key = "RJStopRarity", label = "Stop On Bee Rarity", options = Bees.RJ_RARITIES },
+              lb(function() return "Royal Jelly: " .. Inv.count("Royal Jelly") .. " | Slot: " .. Bees.slotText(Cfg.HiveSlot) .. "\n" .. Bees.rjStatus end),
+          }),
+      },
+      right = {
+          sec("Feed Until Gifted", "hv_feed", {
+              tg("FeedGifted", "Feed Until Gifted"),
+              { t = "text", key = "FeedAmount", label = "Quantidade por vez (digite)", number = true, min = 1, max = 99999 },
+              { t = "text", key = "FeedLimit", label = "Limite total (digite)", number = true, min = 1, max = 9999999 },
+              lb(function() return Bees.favText() .. "\n" .. Bees.feedStatus end),
+          }),
+          sec("Level Up Hive", "hv_lvl", {
+              tg("AutoLevelHive", "Auto Level Up Hive"),
+              sl("TargetLevel", "Target Level", 1, 25, 1),
+              bt("Calcular Treats necessários", function() Bees.calcTreats() end),
+              lb(function() return Bees.levelInfo() .. "\n" .. Bees.lvlStatus end),
+          }),
+          sec("Abelhas", "hv_list", {
+              lb(function()
+                  local t = {}
+                  for _, i in ipairs(Bees.list()) do
+                      table.insert(t, string.format("%s  %s Lv%d%s", i.slot, i.name or "?", i.level, i.gifted and " ★" or ""))
+                  end
+                  return #t > 0 and table.concat(t, "\n") or "Colmeia não encontrada"
+              end),
+          }, false),
       } },
     { name = "Debug", icon = "🐞",
       left = {
