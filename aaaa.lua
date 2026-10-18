@@ -1,5 +1,5 @@
 --[[
-    BSU v1.3.0 — Bee Swarm Unleashed
+    BSU v1.4.1 — Bee Swarm Unleashed
     Reescrito do zero:
       * fila de tarefas por prioridade (cada tarefa diz SE quer rodar e POR QUÊ)
       * interrupção padronizada (token raro, colmeia, etc. param o que estiver rodando)
@@ -16,7 +16,7 @@ if _G.BSU2 and _G.BSU2.Destroy then pcall(_G.BSU2.Destroy) end
 if _G.BSU and _G.BSU.Destroy then pcall(_G.BSU.Destroy) end
 task.wait(0.15)
 
-local VERSION = "1.3.0"
+local VERSION = "1.4.1"
 local Env = { Running = true, Conns = {} }
 _G.BSU2 = Env
 
@@ -96,10 +96,11 @@ local Defaults = {
                    "Red Extract", "Blue Extract", "Oil", "Enzyme", "Magic Bean" },
     -- Bolhas
     AutoBubbles = true, BubblesFirst = true, OnlyMyBubbles = true,
+    FarmFlames = true, FlameHeatMax = 80,   -- Dark Flames (padrão, sem opção)
     -- Marks
     StayInMarks = true, MarkPrefer = "HoneyMark+",
     -- Sprout
-    AutoSprout = true, SproutLootTime = 30,
+    AutoSprout = true, SproutLootTime = 90,
     BeanOn = false, BeanField = "", BeanCount = 5, BeanDelay = 10, SproutAllTokens = false, SproutTokenDelay = 0.25,   -- plantar sprouts com Magic Bean
     SproutRarities = {}, SproutRaritiesSeen = {}, SproutRarePlus = false,   -- Rare+: ignora Basic
     -- Combate
@@ -122,7 +123,6 @@ local Defaults = {
     RequireBooster = true, StaggerBoosters = false, UseGlitter = false, UseDice = false, ExtendOnce = false,
     MinBoostFarm = 1, WantedBoost = 2, RenewTime = 70, MaxDicePerRenew = 15,
     AutoMaterials = false, Mats = {}, UseTicketConverters = false, ConverterCD = 5, UseMicroConverters = false, MicroCD = 0, MicroKeep = 0,   -- [item] = { on = bool, interval = n }
-    RemoteCollect = false,    -- coleta à distância (teste)
     StopEverything = false,   -- pausa tudo que mexe o personagem (jogar na mão)
     -- Hive (ovos, Royal Jelly, level)
     HiveSlot = "", AutoGiftedBasic = false, BuyBasicEggs = false, EggBuyAmount = 10,
@@ -158,6 +158,9 @@ do
         if (tonumber(t.CfgVer) or 1) < 2 then Cfg.IgnoreBomb = false end
         Cfg.CfgVer = Defaults.CfgVer
     end
+    -- padrão, sem opção: coleta remota de tokens e farm das Dark Flames sempre ligados
+    Cfg.AutoTokens, Cfg.FarmFlames, Cfg.SproutAllTokens = true, true, true
+    Cfg.SproutLootTime = 120   -- loot da sprout é automático (3s sem "From Sprout"); isso é só o limite interno
 end
 
 local CfgListeners = {}
@@ -634,6 +637,8 @@ do
     local nt = remote("NotificationSent")
     if nt then
         conn(nt.OnClientEvent:Connect(function(_, text)
+            -- "+X item (From Sprout)" = pegou loot da sprout: o loot ainda está rolando
+            if type(text) == "string" and text:lower():find("from sprout", 1, true) then Sprout.lastLootTok = tick() end
             if type(text) == "string" and text:lower():find("sprout", 1, true) and not text:find("From Sprout", 1, true) then
                 Sprout.addLog("NOTIF " .. text)
             end
@@ -675,8 +680,18 @@ function Sprout.fieldOf(s)
     local p = U.pos(s)
     return p and F.of(p)
 end
+-- Loot acaba sozinho: 3s sem pegar loot novo ("... (From Sprout)" na notificação) (cada sprout tem um tempo de loot diferente).
+-- "Tempo máximo de loot" (slider) é só o limite de segurança.
+Sprout.LOOT_IDLE = 3
 function Sprout.looting()
-    return Sprout.lootField ~= nil and tick() < Sprout.lootUntil
+    if Sprout.lootField == nil or tick() >= Sprout.lootUntil then return false end
+    local start = Sprout.lootStart or 0
+    if tick() - start > Sprout.LOOT_IDLE and tick() - math.max(start, Sprout.lastLootTok or 0) > Sprout.LOOT_IDLE then
+        Con.log("Info", string.format("Sprout: loot acabou (%ds sem loot From Sprout, durou %.0fs)", Sprout.LOOT_IDLE, tick() - start))
+        Sprout.lootUntil = 0
+        return false
+    end
+    return true
 end
 function Sprout.update()
     if not Cfg.AutoSprout then Sprout.cur, Sprout.lootField = nil, nil return end
@@ -1097,7 +1112,7 @@ function Rare.remoteField()
     if not hrp then return nil end
     local here = F.of(hrp.Position)
     if not here then return nil end
-    if Cfg.RemoteCollect and firetouchinterest then return here end
+    if Cfg.AutoTokens and firetouchinterest then return here end   -- coleta de tokens é remota
     if Cfg.SproutAllTokens and firetouchinterest then
         local sf = (Sprout.looting() and Sprout.lootField) or (Sprout.cur and Sprout.field) or nil
         if sf == here then return here end
@@ -1116,7 +1131,8 @@ function Rare.find()
         if U.match(Cfg.RareTokens, t.Name) and Tok.usable(t) then
             local p = U.pos(t)
             local f = p and F.of(p)
-            if f and F.unlocked(f) and f ~= skipF then
+            local skipHb = skipF and F.hb(skipF)
+            if f and F.unlocked(f) and f ~= skipF and not (skipHb and F.inside(skipHb, p, 15)) then
                 local d = (p - hrp.Position).Magnitude
                 if not bd or d < bd then best, bd = { inst = t, pos = p }, d end
             end
@@ -1153,6 +1169,7 @@ end
 local BubbleSources = {
     PopBee = { bee = "PopBee", method = "beeAtSpawn", radius = 1 },
 }
+local Abyss   -- (preenchido mais abaixo, seção ABYSS)
 local Bub = { list = {}, owner = {}, touched = {}, bees = {}, cache = {} }
 local function beePos(b)
     local p = b:FindFirstChild("Bee")
@@ -1235,7 +1252,9 @@ end
 function Bub.alive(b) return b.Parent ~= nil and b:GetAttribute("Pop") ~= true end
 function Bub.mine(b)
     if not Cfg.OnlyMyBubbles then return true end
-    return Bub.owner[b] == LP.UserId
+    if Bub.owner[b] == LP.UserId then return true end
+    -- bolha Gold do seu Abyss vem com Owner=-1
+    return tostring(b:GetAttribute("Type") or "") == "Gold" and Abyss and Abyss.nearMine(b.Position)
 end
 function Bub.inField(hb)
     local hrp = U.hrp()
@@ -1284,6 +1303,174 @@ function Bub.pop(e)
     Bub.touched[b] = tick() + 3
 end
 ------------------------------------------------------------------
+-- FLAMES (workspace.FX.Flame): Part 5x8x5, atributos Type ("Dark" = Dark Flame) e Owner (UserId).
+-- Duram ~4s. Ficar em cima dá Flame Heat (buff em PlayerGui.Main.Buffs, stack x1..). Dark enche mais rápido.
+------------------------------------------------------------------
+local Flame = { list = {}, born = {}, cache = {}, LIFE = 4 }
+local function flameAdd(c)
+    if c.Name ~= "Flame" or not c:IsA("BasePart") then return end
+    Flame.list[c] = true
+    Flame.born[c] = tick()
+end
+if FXF then
+    for _, c in ipairs(FXF:GetChildren()) do flameAdd(c) end
+    conn(FXF.ChildAdded:Connect(flameAdd))
+    conn(FXF.ChildRemoved:Connect(function(c) Flame.list[c], Flame.born[c] = nil, nil end))
+end
+function Flame.isDark(f) return tostring(f:GetAttribute("Type") or ""):lower() == "dark" end
+function Flame.mine(f) return tonumber(f:GetAttribute("Owner")) == LP.UserId end
+function Flame.left(f) return Flame.LIFE - (tick() - (Flame.born[f] or tick())) end
+-- stack atual do Flame Heat (0 = sem o buff)
+function Flame.heat()
+    local pg = LP:FindFirstChild("PlayerGui")
+    local main = pg and pg:FindFirstChild("Main")
+    local buffs = main and main:FindFirstChild("Buffs")
+    if not buffs then return 0 end
+    for _, b in ipairs(buffs:GetChildren()) do
+        if U.key(b.Name) == "flameheat" then
+            local st = b:FindFirstChild("Stack")
+            local n = st and st:IsA("TextLabel") and tonumber(st.Text:match("x(%d+)"))
+            if not n then
+                local hd = b:FindFirstChild("Info") and b.Info:FindFirstChild("Header")
+                n = hd and hd:IsA("TextLabel") and tonumber(hd.Text:match("%(x(%d+)%)"))
+            end
+            return n or 1
+        end
+    end
+    return 0
+end
+-- Ponto do token Plasma Lightning: as 6 Dark Flames nascem em volta de onde ele estava.
+-- Guarda a última posição de cada token "Plasma Lightning" e, quando ele some (pego), vira o centro.
+Flame.anchor = nil   -- { pos, t }
+do
+    local seen = {}   -- [token] = última posição (sai da tabela quando o token some)
+    task.spawn(function()
+        while running() do
+            task.wait(0.05)
+            for t in pairs(Tok.list) do
+                if not seen[t] and U.key(t.Name):find("plasmalightning", 1, true) then seen[t] = U.pos(t) end
+            end
+            for t, p in pairs(seen) do
+                if not t.Parent or t:GetAttribute("Collected") == true then
+                    Flame.anchor = { pos = p, t = tick() }
+                    seen[t] = nil
+                else
+                    seen[t] = U.pos(t) or p
+                end
+            end
+        end
+    end)
+end
+-- Só as DARK FLAMES (as 6 do Plasma Lightning): fica NO MEIO delas, pega o heat de todas ao mesmo tempo.
+-- Agrupa as suas Dark Flames da field que estão perto umas das outras e devolve o centro do maior grupo.
+Flame.GROUP_R = 20
+function Flame.cluster(hb)
+    local hrp = U.hrp()
+    if not hrp or not hb then return nil end
+    local darks = {}
+    for f in pairs(Flame.list) do
+        if f.Parent and Flame.isDark(f) and Flame.mine(f) and Flame.left(f) > 0.3 and F.inside(hb, f.Position) then
+            table.insert(darks, f)
+        end
+    end
+    if #darks == 0 then return nil end
+    local best, bestN
+    for _, f in ipairs(darks) do
+        local grp = {}
+        for _, g in ipairs(darks) do
+            if U.fdist(f.Position, g.Position) <= Flame.GROUP_R then table.insert(grp, g) end
+        end
+        if not bestN or #grp > bestN then best, bestN = grp, #grp end
+    end
+    local sum, left = Vector3.zero, 0
+    for _, f in ipairs(best) do
+        sum += f.Position
+        left = math.max(left, Flame.left(f))
+    end
+    local c = sum / #best
+    local pos = Vector3.new(c.X, best[1].Position.Y, c.Z)
+    -- tinha um Plasma Lightning ali agorinha: o centro é onde o token estava
+    local an = Flame.anchor
+    if an and tick() - an.t < 6 and U.fdist(an.pos, c) <= Flame.GROUP_R then
+        pos = Vector3.new(an.pos.X, best[1].Position.Y, an.pos.Z)
+    end
+    if not F.safe(hb, pos) then pos = best[1].Position end   -- centro fora da área segura: fica na flame
+    local d = U.fdist(pos, hrp.Position)
+    if left <= d / math.max(Cfg.WalkSpeed, 16) + 0.4 then return nil end   -- não dá tempo de chegar
+    return { pos = pos, flames = best, n = #best, dist = d, left = left }
+end
+function Flame.best(hb)
+    local c = Flame.cache
+    if c.hb == hb and tick() - (c.t or 0) < 0.15 then return c.v end
+    c.hb, c.t, c.v = hb, tick(), Flame.cluster(hb)
+    return c.v
+end
+-- vai pro meio das Dark Flames. stay = fica lá enquanto alguma existir (ou stop() mandar sair)
+function Flame.go(e, stay, stop)
+    Flame.cache.t = 0
+    act(string.format("Dark Flames (%d) | Flame Heat x%d", e.n, Flame.heat()))
+    local function alive()
+        for _, f in ipairs(e.flames) do if f.Parent and Flame.left(f) > 0 then return true end end
+        return false
+    end
+    Move.walk(e.pos, { reach = 1.5, stop = function() return not alive() or (stop and stop()) end })
+    if not stay then return end
+    while alive() and running() and not (stop and stop()) do task.wait(0.1) end
+end
+
+------------------------------------------------------------------
+-- ABYSS (abelha mítica): pegar o token "Abyss" cria um rift em workspace.FX.Abyss
+-- (Part cilindro 12x24x24, atributo OwnerID; existe uma cópia visual com OwnerID=-1).
+-- Dentro dele: a cada 0,1s converte 2% da bolsa (Honey at Hive) e as bolhas perto viram Gold.
+------------------------------------------------------------------
+Abyss = { list = {}, born = {} }
+local function abyssAdd(c)
+    if c.Name ~= "Abyss" or not c:IsA("BasePart") then return end
+    task.defer(function()
+        if c.Parent and tonumber(c:GetAttribute("OwnerID")) == LP.UserId then
+            Abyss.list[c] = true
+            Abyss.born[c] = tick()
+            Con.log("Info", "Abyss rift seu apareceu")
+        end
+    end)
+end
+if FXF then
+    for _, c in ipairs(FXF:GetChildren()) do abyssAdd(c) end
+    conn(FXF.ChildAdded:Connect(abyssAdd))
+    conn(FXF.ChildRemoved:Connect(function(c)
+        if Abyss.list[c] then Con.log("Info", string.format("Abyss rift durou %.1fs", tick() - (Abyss.born[c] or tick()))) end
+        Abyss.list[c], Abyss.born[c] = nil, nil
+    end))
+end
+function Abyss.radius(a) return math.max(4, math.min(a.Size.Y, a.Size.Z) / 2) end
+-- rift seu dentro da field (o mais perto)
+function Abyss.best(hb)
+    local hrp = U.hrp()
+    if not hrp or not hb then return nil end
+    local best, bd
+    for a in pairs(Abyss.list) do
+        if a.Parent and F.inside(hb, a.Position) then
+            local d = U.fdist(a.Position, hrp.Position)
+            if not bd or d < bd then best, bd = a, d end
+        end
+    end
+    return best and { inst = best, pos = best.Position, r = Abyss.radius(best), dist = bd } or nil
+end
+-- tem rift seu vivo (ele converte a bolsa: não precisa ir pra colmeia nem gastar converter)
+function Abyss.any()
+    for a in pairs(Abyss.list) do if a.Parent then return true end end
+    return false
+end
+function Abyss.inside(e, p) return U.fdist(e.pos, p) <= e.r - 1.5 end
+-- bolha Gold perto do seu rift é sua (vem com Owner=-1)
+function Abyss.nearMine(p)
+    for a in pairs(Abyss.list) do
+        if a.Parent and U.fdist(a.Position, p) <= Abyss.radius(a) + 12 then return true end
+    end
+    return false
+end
+
+------------------------------------------------------------------
 -- SPROUT: COLETAR TODOS OS TOKENS DA FIELD (enquanto quebra/lootea a sprout)
 -- Cada token é encostado quando chega na idade escolhida (ex.: 0,25s de vida), um por vez
 -- conforme vão nascendo: não pega tudo de uma vez. Leve: só olha os tokens que existem.
@@ -1296,14 +1483,14 @@ task.spawn(function()
             local field = (Sprout.looting() and Sprout.lootField) or (Sprout.cur and Sprout.field) or nil
             local hb = field and F.hb(field)
             local hrp = U.hrp()
-            if hb and hrp and F.inside(hb, hrp.Position) then
+            if hb and hrp and F.inside(hb, hrp.Position, 20) then
                 local now, delay = tick(), tonumber(Cfg.SproutTokenDelay) or 0.25
                 for t in pairs(Tok.list) do
                     local born = Tok.born[t]
                     local last = SproutTok.done[t]
                     if born and now - born >= delay and (not last or now - last > 1)
                        and t:IsA("BasePart") and t.Parent and t:GetAttribute("Collected") ~= true
-                       and Tok.ownerOk(t) and not Tok.nameBlocked(t) and F.inside(hb, t.Position) then
+                       and Tok.ownerOk(t) and not Tok.nameBlocked(t) and F.inside(hb, t.Position, 12) then
                         SproutTok.done[t] = now
                         pcall(firetouchinterest, hrp, t, 0)
                         pcall(firetouchinterest, hrp, t, 1)
@@ -1316,31 +1503,45 @@ task.spawn(function()
 end)
 
 ------------------------------------------------------------------
--- COLETA À DISTÂNCIA (teste): encosta (firetouchinterest) em todos os tokens e bolhas
--- do campo onde você está, sem andar. Funciona até com Stop Everything ligado.
+-- COLETA DE TOKENS 100% REMOTA (padrão): encosta (firetouchinterest) em todos os tokens do campo
+-- onde você está, sem andar. O personagem só anda pra flames, bolhas e marks.
+-- Sem firetouchinterest no executor: volta a andar até os tokens como antes.
 ------------------------------------------------------------------
-local Remote = { touches = 0, last = "" }
+local Remote = { touches = 0, last = "", done = setmetatable({}, { __mode = "k" }) }
+function Remote.on() return Cfg.AutoTokens and firetouchinterest ~= nil end
+Remote.PAD = 12   -- pega também o que cai um pouco pra fora da field (loot da sprout espalha)
 task.spawn(function()
     while running() do
-        task.wait(0.3)
-        if Cfg.RemoteCollect and firetouchinterest and U.alive() then
+        task.wait(0.1)
+        if Remote.on() and U.alive() then
             local hrp = U.hrp()
             local fname, hb = F.of(hrp.Position)
+            -- sprout com "Collect every token" ligado: deixa ele cuidar (tem o delay por idade)
+            local sf = Cfg.SproutAllTokens and ((Sprout.looting() and Sprout.lootField) or (Sprout.cur and Sprout.field)) or nil
+            -- saiu um pouco da field durante o loot da sprout: continua valendo a field da sprout
+            if not hb and sf and F.inside(F.hb(sf), hrp.Position, 20) then fname, hb = sf, F.hb(sf) end
             if hb then
-                local n = 0
-                for t in pairs(Tok.list) do
-                    if t:IsA("BasePart") and t.Parent and t:GetAttribute("Collected") ~= true and Tok.ownerOk(t)
-                       and not Tok.nameBlocked(t) and F.inside(hb, t.Position) then
+                local now, n = tick(), 0
+                for t in pairs(sf ~= fname and Tok.list or {}) do   -- na field da sprout os tokens são do loop da sprout
+                    local last = Remote.done[t]
+                    if (not last or now - last > 0.5) and t:IsA("BasePart") and t.Parent and t:GetAttribute("Collected") ~= true
+                       and Tok.ownerOk(t) and not Tok.nameBlocked(t) and F.inside(hb, t.Position, Remote.PAD) then
+                        Remote.done[t] = now
                         pcall(firetouchinterest, hrp, t, 0)
                         pcall(firetouchinterest, hrp, t, 1)
                         n += 1
                     end
                 end
-                for b in pairs(Bub.list) do
-                    if Bub.alive(b) and Bub.mine(b) and F.inside(hb, b.Position) then
-                        pcall(firetouchinterest, hrp, b, 0)
-                        pcall(firetouchinterest, hrp, b, 1)
-                        n += 1
+                -- bolhas também (as suas, incluindo as Gold do Abyss): estoura sem andar
+                if Cfg.AutoBubbles then
+                    for b in pairs(Bub.list) do
+                        local last = Remote.done[b]
+                        if (not last or now - last > 0.5) and Bub.alive(b) and Bub.mine(b) and F.inside(hb, b.Position, Remote.PAD) then
+                            Remote.done[b] = now
+                            pcall(firetouchinterest, hrp, b, 0)
+                            pcall(firetouchinterest, hrp, b, 1)
+                            n += 1
+                        end
                     end
                 end
                 Remote.touches += n
@@ -2029,6 +2230,14 @@ function Fight.run(hb, label)
 end
 
 function Fight.loot(hb, deaths)
+    if Remote.on() then
+        -- coleta remota: não anda atrás do loot, só espera os drops caírem (são pegos sem andar)
+        act("Loot dos mobs (remoto)")
+        local lastDeath = 0
+        for _, d in ipairs(deaths) do lastDeath = math.max(lastDeath, d.t) end
+        while running() and tick() - lastDeath < 1.5 do task.wait(0.1) end
+        return
+    end
     act("Pegando loot dos mobs")
     Fight.lootHb = hb   -- token raro no meio do loot é pego pelo próprio loot (sem largar o resto)
     local lastDeath = 0
@@ -3380,6 +3589,7 @@ end
 -- converter pronto mais perto (com Medal)
 function TConv.ready()
     if not Cfg.UseTicketConverters or Inv.count("Medal") < 1 then return nil end
+    if Abyss.any() then return nil end   -- rift do Abyss já converte
     local hrp = U.hrp()
     if not hrp then return nil end
     local best, bd
@@ -3450,6 +3660,7 @@ function Micro.cdLeft()
 end
 function Micro.ready()
     if not Cfg.UseMicroConverters then return false end
+    if Abyss.any() then return false end   -- rift do Abyss já converte
     if Inv.count("Micro Converter") <= math.max(0, math.floor(tonumber(Cfg.MicroKeep) or 0)) then return false end
     if Micro.cdLeft() > 0 then return false end
     return Inv.ready("Micro Converter")
@@ -4088,6 +4299,9 @@ function Farm.safePoint(hb, ctx)
 end
 
 function Farm.step(field, loot)
+    -- loot da sprout: com a coleta remota os tokens são pegos sozinhos, então farma normal
+    -- (marks, bolhas, flames, abyss). Sem coleta remota: só tokens, como antes.
+    local skipFx = loot and not Remote.on()
     local hb = F.hb(field)
     if not hb then act("Campo não encontrado: " .. tostring(field)) task.wait(1) return end
     if not F.unlocked(field) then act(U.fname(field) .. " não está liberado (aba Campos)") task.wait(1) return end
@@ -4108,7 +4322,8 @@ function Farm.step(field, loot)
     if Cfg.FieldMobDodge and tick() > (Farm.mobSkip or 0) then
         local mobs = Fight.mobsIn(hb, 6)
         if #mobs > 0 then
-            local sproutMode = loot or (Sprout.cur ~= nil and Sprout.field == field)
+            -- sprout: sem coleta remota só desvia (pra não largar os tokens); com coleta remota luta normal
+            local sproutMode = (loot or (Sprout.cur ~= nil and Sprout.field == field)) and not Remote.on()
             if sproutMode then
                 avoid = Farm.avoidCtx(mobs)
             else
@@ -4128,7 +4343,7 @@ function Farm.step(field, loot)
         end
     end
     local function tryBubble()
-        if loot or not Cfg.AutoBubbles then return false end
+        if skipFx or not Cfg.AutoBubbles or Remote.on() then return false end   -- remoto: bolhas estouram sem andar
         local b
         if avoid then
             for _, e in ipairs(Bub.inField(hb)) do
@@ -4142,7 +4357,7 @@ function Farm.step(field, loot)
         return true
     end
     local function tryToken()
-        if not Cfg.AutoTokens then return false end
+        if not Cfg.AutoTokens or Remote.on() then return false end   -- remoto: tokens são pegos sem andar
         local t
         if avoid then
             t = Tok.inField(hb, function(tk, p) return avoid.ok(p, Farm.isPrio(tk)) end)[1]
@@ -4153,13 +4368,66 @@ function Farm.step(field, loot)
         Tok.collect(t, hb, not loot)
         return true
     end
+    -- FLAMES: Flame Heat abaixo do limite = flame antes dos tokens (menos os da lista de prioridade);
+    -- acima = mesma prioridade das bolhas (passa por cima e segue)
+    local function flameOk(e) return not avoid or avoid.ok(e.pos, false) end
+    local function tryFlame(stay)
+        if skipFx or not Cfg.FarmFlames then return false end
+        local e = Flame.best(hb)
+        if not e or not flameOk(e) then return false end
+        Flame.go(e, stay, function()
+            -- token da prioridade aparece: sai da flame e vai pegar (só sem a coleta remota)
+            if Cfg.AutoTokens and not Remote.on() then
+                local t = Tok.best(hb)
+                if t and t.prio < 500 then return true end
+            end
+            return stay and Flame.heat() >= Cfg.FlameHeatMax   -- encheu: para de esperar em cima
+        end)
+        return true
+    end
+    local function tryPrioToken()
+        if not Cfg.AutoTokens or Remote.on() then return false end
+        local t = Tok.best(hb)
+        if not t or t.prio >= 500 or (avoid and not avoid.ok(t.pos, true)) then return false end
+        Tok.collect(t, hb, not loot)
+        return true
+    end
+    -- ABYSS: rift seu na field = prioridade máxima. Fica dentro dele enquanto existir
+    -- (converte a bolsa e deixa as bolhas Gold); dentro, estoura as bolhas Gold que estão no rift.
+    if not skipFx then
+        local ab = Abyss.best(hb)
+        if ab and not (avoid and avoid.low and avoid.dist(ab.pos) < Farm.AVOID_R) then
+            local a = ab.inst
+            act(string.format("Abyss rift | bolsa %d%%", math.floor(U.bagPct() * 100)))
+            if not Abyss.inside(ab, hrp.Position) then
+                Move.walk(ab.pos, { reach = 2, stop = function() return not a.Parent end })
+                return
+            end
+            -- bolha dentro do rift (Gold primeiro): estoura sem sair
+            if Cfg.AutoBubbles and not Remote.on() then
+                for _, e in ipairs(Bub.inField(hb)) do
+                    if Abyss.inside(ab, e.pos) then Bub.pop(e) return end
+                end
+            end
+            -- fica parado dentro do rift (a ferramenta continua coletando) até ele sumir ou outra tarefa chamar
+            local hum = U.hum and U.hum()
+            if hum then hum:MoveTo(hrp.Position) end
+            local t0 = tick()
+            while a.Parent and running() and tick() - t0 < 1 and not Sched.check() do task.wait(0.1) end
+            return
+        end
+    end
+    local lowHeat = Cfg.FarmFlames and not skipFx and Flame.heat() < Cfg.FlameHeatMax
+    if lowHeat then
+        if tryPrioToken() or tryFlame(true) then return end
+    end
     if Cfg.BubblesFirst then
-        if tryBubble() or tryToken() then return end
+        if tryBubble() or (not lowHeat and tryFlame(false)) or tryToken() then return end
     else
-        if tryToken() or tryBubble() then return end
+        if tryToken() or tryBubble() or (not lowHeat and tryFlame(false)) then return end
     end
     local target
-    if Cfg.StayInMarks and not loot then target = Mark.walkPoint(hb) end
+    if Cfg.StayInMarks and not skipFx then target = Mark.walkPoint(hb) end
     target = target or Grid.next(field, hb)
     if avoid and target and not avoid.ok(target, false) then target = Farm.safePoint(hb, avoid) or target end
     act((loot and "Loot da sprout em " or "Farmando em ") .. U.fname(field))
@@ -4168,13 +4436,15 @@ function Farm.step(field, loot)
             if avoid then
                 local hp = U.hrp()
                 if avoid.low and hp and avoid.dist(hp.Position) < Farm.AVOID_R then return true end   -- mob chegou: foge
-                if Cfg.AutoTokens and Tok.inField(hb, function(tk, p) return avoid.ok(p, Farm.isPrio(tk)) end)[1] then return true end
-                if not loot and Cfg.AutoBubbles then
+                if Cfg.AutoTokens and not Remote.on() and Tok.inField(hb, function(tk, p) return avoid.ok(p, Farm.isPrio(tk)) end)[1] then return true end
+                if not skipFx and Cfg.AutoBubbles and not Remote.on() then
                     for _, e in ipairs(Bub.inField(hb)) do if avoid.ok(e.pos, false) then return true end end
                 end
                 return false
             end
-            return (Cfg.AutoTokens and Tok.best(hb) ~= nil) or (not loot and Cfg.AutoBubbles and Bub.best(hb) ~= nil)
+            return (Cfg.AutoTokens and not Remote.on() and Tok.best(hb) ~= nil) or (not skipFx and Cfg.AutoBubbles and not Remote.on() and Bub.best(hb) ~= nil)
+                or (not skipFx and Cfg.FarmFlames and Flame.best(hb) ~= nil)
+                or (not skipFx and Abyss.best(hb) ~= nil)
         end,
         onTick = function(p) Grid.touch(field, hb, p) end,
     })
@@ -4277,6 +4547,7 @@ Tasks = {
     { name = "Convert", label = "Convertendo", over = { Farm = true },
       want = function()
           if not Cfg.AutoConvert or Sprout.looting() then return nil end
+          if Abyss.any() then return nil end   -- rift do Abyss converte a bolsa: fica nele
           local pct = U.bagPct() * 100
           if pct >= Cfg.ConvertPercent then return string.format("bolsa em %d%%", math.floor(pct)) end
       end,
@@ -4380,6 +4651,7 @@ for r, list in pairs({
     Mythic = { "Abyssal Bee", "Fractal Bee", "Plasma Bee" },
     Exclusive = { "Giroy Bee" }, Event = { "Laser Bee" },
 }) do for _, n in ipairs(list) do Bees.rarity[U.key(n)] = r end end
+Bees.lvCache = setmetatable({}, { __mode = "k" })   -- [modelo da abelha] = level (do GetBeeStats, quando a plaquinha não tem)
 function Bees.rarityOf(name) return name and Bees.rarity[U.key(name)] or nil end
 -- raridade desconhecida: pergunta pro jogo (GetBeeStats(abelha) -> { nome, level, raridade, ... })
 local StatsR = remote("GetBeeStats")
@@ -4401,6 +4673,21 @@ function Bees.askRarity(info)
         task.wait(0.05)
     end
     return Bees.rarityOf(info.name)
+end
+-- level pelo servidor (GetBeeStats) quando a plaquinha da célula não mostra (células mais altas da colmeia)
+function Bees.askLevel(info)
+    if not (StatsR and info.bee) then return 0 end
+    local t = tick()
+    pcall(function() StatsR:FireServer(info.bee) end)
+    while tick() - t < 2 and running() do
+        local a = Bees.statsAns
+        if a and a.t > t then
+            if a.level then Bees.lvCache[info.bee] = a.level end
+            return a.level or 0
+        end
+        task.wait(0.05)
+    end
+    return 0
 end
 -- lista inicial (completa sozinha com o UpdateCollection do jogo)
 Bees.TYPES = { "Basic Bee", "Joyful Bee", "Curious Bee", "Hasty Bee", "Honey Bee", "Calm Bee", "Giroy Bee", "Blushy Bee",
@@ -4454,7 +4741,8 @@ function Bees.cellInfo(c)
     local gc = c:FindFirstChild("GiftedCell")
     return {
         slot = c.Name:gsub("^C", ""), cell = c, bee = bee, name = bee and prettyBee(bee.Name) or nil,
-        level = lbl and tonumber(lbl.Text) or 0, gifted = gc ~= nil and gc:IsA("BasePart") and gc.Transparency < 0.5,
+        lvLabel = lbl ~= nil and tonumber((tostring(lbl.Text):match("(%d+)"))) ~= nil,
+        level = (lbl and tonumber((tostring(lbl.Text):match("(%d+)")))) or (bee and Bees.lvCache[bee]) or 0, gifted = gc ~= nil and gc:IsA("BasePart") and gc.Transparency < 0.5,
         owned = c:FindFirstChild("Cell") ~= nil,   -- slot comprado (tem o modelo da célula)
     }
 end
@@ -4685,9 +4973,23 @@ function Bees.rjStep()
 end
 
 -- AUTO LEVEL UP HIVE: dá Treat pras abelhas abaixo do Target Level (menor level primeiro)
-function Bees.below()
+function Bees.below(noAsk)
     local t = {}
-    for _, i in ipairs(Bees.list()) do if i.level > 0 and i.level < Cfg.TargetLevel then table.insert(t, i) end end
+    local all, noLv = Bees.list(), 0
+    for _, i in ipairs(all) do
+        if not i.lvLabel and not noAsk then   -- sem plaquinha: pergunta pro servidor (sempre atualizado)
+            local lv = Bees.askLevel(i)
+            if lv > 0 then i.level = lv end
+        end
+        if i.level <= 0 then noLv += 1 end
+        if i.level > 0 and i.level < Cfg.TargetLevel then table.insert(t, i) end
+    end
+    if not noAsk and tick() - (Bees.belowLogT or 0) > 60 then
+        Bees.belowLogT = tick()
+        local cs = Bees.cells()
+        Con.log("Info", string.format("Hive: %d células, %d com abelha, %d sem level, %d abaixo do %d",
+            cs and #cs:GetChildren() or 0, #all, noLv, #t, Cfg.TargetLevel))
+    end
     table.sort(t, function(a, b) return a.level < b.level end)
     return t
 end
@@ -4702,6 +5004,7 @@ local function askFeed(slot)
     end
     return nil
 end
+Bees.LVL_PRIO = { Exclusive = 7, Event = 6, Mythic = 5, Legendary = 4, Epic = 3, Rare = 2, Common = 1 }
 function Bees.levelStep()
     local list = Bees.below()
     if #list == 0 then
@@ -4715,14 +5018,21 @@ function Bees.levelStep()
         setCfg("AutoLevelHive", false)
         return
     end
+    -- prioridade: Exclusive > Event > Mythic > Legendary > Epic > Rare > Common; mesma raridade: menor level
+    for _, x in ipairs(list) do if not Bees.rarityOf(x.name) then Bees.askRarity(x) end end
+    table.sort(list, function(x, y)
+        local rx, ry = Bees.LVL_PRIO[Bees.rarityOf(x.name) or ""] or 0, Bees.LVL_PRIO[Bees.rarityOf(y.name) or ""] or 0
+        if rx ~= ry then return rx > ry end
+        return x.level < y.level
+    end)
     local b = list[1]
     local a = askFeed(b.slot)
     if not a then Bees.lvlStatus = "Sem resposta do FeedEvent" task.wait(2) return end
     local n = math.min(a.need, treats)
     if n <= 0 then task.wait(1) return end
     useOn("Treat", b.slot, n)
-    Bees.lvlStatus = string.format("%s %s Lv%d: %d Treat%s | faltam %d abelhas | Treat: %d",
-        b.slot, b.name or "?", b.level, n, n < a.need and " (faltou Treat)" or "", #list, treats - n)
+    Bees.lvlStatus = string.format("%s %s (%s) Lv%d: %d Treat%s | faltam %d abelhas | Treat: %d",
+        b.slot, b.name or "?", Bees.rarityOf(b.name) or "?", b.level, n, n < a.need and " (faltou Treat)" or "", #list, treats - n)
     task.wait(1.2)
 end
 -- quantos Treats faltam: o bond é ACUMULADO (Lvl 6 = 4000/15000 -> o 15000 é o total pra chegar no Lvl 7).
@@ -4778,7 +5088,7 @@ function Bees.calcTreats()
     end)
 end
 function Bees.levelInfo()
-    local list = Bees.below()
+    local list = Bees.below(true)
     local txt = string.format("Abaixo do level %d: %d abelha(s) | Treat: %d", Cfg.TargetLevel, #list, invHave("Treat"))
     local c = Bees.calc
     if c.busy then
@@ -5630,10 +5940,8 @@ TabDefs = {
       right = {
           sec("Sprout Settings", "farm_sprout", {
               tg("AutoSprout", "Farm Sprouts"),
-              sl("SproutLootTime", "Tempo de loot depois de quebrar", 10, 90, 5, { suffix = "s" }),
               tg("SproutRarePlus", "Rare+ (farma todas menos Basic)"),
-              tg("SproutAllTokens", "Collect every token in the field while farming sprouts"),
-              sl("SproutTokenDelay", "Pegar cada token com quantos segundos de vida", 0.1, 2, 0.05, { suffix = "s" }),
+              sl("SproutTokenDelay", "Sprout: pegar cada token (remoto) com quantos segundos de vida", 0.1, 2, 0.05, { suffix = "s" }),
               lb(function()
                   if not firetouchinterest then return "Seu executor não tem firetouchinterest (não funciona)" end
                   return "Tokens pegos na sprout: " .. SproutTok.count
@@ -5659,16 +5967,25 @@ TabDefs = {
               tg("OnlyMyBubbles", "Só minhas bolhas"),
               lb(function() return Bub.statusText(curHB()) end),
           }, false),
+          sec("Flames", "farm_flames", {
+              sl("FlameHeatMax", "Abaixo desse Flame Heat (x): flames antes dos tokens", 10, 150, 5),
+              lb(function()
+                  local hb = curHB()
+                  local e = hb and Flame.cluster(hb)
+                  local ab = hb and Abyss.best(hb)
+                  return string.format("Flame Heat: x%d | Dark Flames suas agora: %d\nAbaixo de x%d: fica no meio delas. Acima: igual bolha.\nAbyss rift: %s (prioridade máxima: fica dentro e estoura as bolhas Gold)",
+                      Flame.heat(), e and e.n or 0, Cfg.FlameHeatMax, ab and "ativo" or "nenhum")
+              end),
+          }, false),
       } },
     { name = "Tokens", icon = "🎯",
       left = {
           sec("Tokens", "tok_main", {
-              tg("AutoTokens", "Auto coletar tokens"), tg("OnlyMyTokens", "Ignorar tokens de outros players"),
+              tg("OnlyMyTokens", "Ignorar tokens de outros players"),
               tg("IgnoreBomb", "Ignorar Bombs"), tg("IgnoreBoost", "Ignorar Boosts"),
-              tg("RemoteCollect", "Coleta à distância (teste)"),
               lb(function()
-                  if not firetouchinterest then return "Coleta à distância: seu executor não tem firetouchinterest" end
-                  return string.format("Coleta à distância: %d toques (campo: %s). Funciona com Stop Everything.", Remote.touches, Remote.last ~= "" and Remote.last or "-")
+                  if not firetouchinterest then return "Coleta remota: seu executor não tem firetouchinterest (anda até os tokens)" end
+                  return string.format("Tokens e bolhas 100%% remotos: %d toques (campo: %s). O personagem só anda pra Dark Flames, Abyss e marks.", Remote.touches, Remote.last ~= "" and Remote.last or "-")
               end),
               { t = "text", key = "TokenPriority", label = "Prioridade extra (vírgula)", list = true, placeholder = "ex: Link, Haste" },
               { t = "text", key = "TokenBlacklist", label = "Nunca pegar (vírgula)", list = true },
